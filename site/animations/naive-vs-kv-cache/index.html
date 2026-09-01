@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>朴素推理 vs KV Cache：O(N²) vs O(N)</title>
+<meta name="hyperframes:composition" content="naive-vs-kv-cache">
+<meta name="hyperframes:width" content="1280">
+<meta name="hyperframes:height" content="720">
+<meta name="hyperframes:duration" content="13">
+<meta name="hyperframes:fps" content="30">
+<link rel="stylesheet" href="anim.css">
+<style>
+  .lane { width: 1200px; height: 244px; left: 40px; }
+  #lane-naive { top: 106px; }
+  #lane-cache { top: 384px; }
+  .lane-badge { position: absolute; top: 15px; right: 230px; }
+  .step-label { position: absolute; top: 46px; left: 20px; font-family: var(--mono); font-size: 13px; color: var(--mut); }
+  .tok-row { top: 74px; }
+  .total-box { position: absolute; top: 60px; right: 24px; text-align: right; }
+  .total-label { font-size: 12px; color: var(--mut); }
+  .total-num { font-family: var(--mono); font-size: 40px; font-weight: 650; line-height: 1.1; }
+  .total-unit { font-family: var(--mono); font-size: 13px; color: var(--mut); }
+  .lane-note { position: absolute; bottom: 14px; left: 20px; font-size: 12.5px; color: var(--mut); }
+  .gen-slot { opacity: 0; }
+  .reuse-line { position: absolute; left: 20px; top: 128px; height: 2px; background: var(--green); width: 0; }
+  .reuse-lbl { position: absolute; left: 230px; top: 120px; font-size: 12px; color: var(--green); opacity: 0; }
+</style>
+</head>
+<body>
+<div id="root" data-composition-id="naive-vs-kv-cache" data-start="0" data-duration="13" data-width="1280" data-height="720">
+  <header class="hf-head">
+    <div class="hf-head-text">
+      <span class="hf-kicker">Chapter 02 · KV Cache 与内存优化</span>
+      <h1 class="hf-title">朴素推理 vs KV Cache：O(N²) vs O(N)</h1>
+    </div>
+    <span class="hf-chapter">03 / 12</span>
+  </header>
+
+  <div id="scene">
+    <div class="panel lane" id="lane-naive">
+      <span class="stage-label">朴素推理 · 每步重算历史</span>
+      <span class="lane-badge badge badge-red">总计算量 O(N²)</span>
+      <span class="step-label" id="nv-step">准备生成第 1 个 token …</span>
+      <div class="chip tok-row" id="nv-c0" style="left:20px;">今</div>
+      <div class="chip tok-row" id="nv-c1" style="left:68px;">天</div>
+      <div class="chip tok-row" id="nv-c2" style="left:116px;">天</div>
+      <div class="chip tok-row" id="nv-c3" style="left:164px;">气</div>
+      <div class="chip chip-red tok-row gen-slot" id="nv-g0" style="left:212px;">真</div>
+      <div class="chip chip-red tok-row gen-slot" id="nv-g1" style="left:260px;">好</div>
+      <div class="chip chip-red tok-row gen-slot" id="nv-g2" style="left:308px;">！</div>
+      <div class="total-box">
+        <div class="total-label">累计 K/V 计算</div>
+        <div class="total-num" id="nv-total" style="color:var(--red);">0</div>
+        <div class="total-unit">组</div>
+      </div>
+      <p class="lane-note">每生成 1 个 token，都把前面所有 token 的 K/V 重新算一遍（红色 = 本步重算）</p>
+    </div>
+
+    <div class="panel lane" id="lane-cache">
+      <span class="stage-label">KV Cache · 算过一次就存下来</span>
+      <span class="lane-badge badge badge-green">总计算量 O(N)</span>
+      <span class="step-label" id="kc-step">历史 K/V 已在缓存中</span>
+      <div class="chip chip-violet tok-row" id="kc-c0" style="left:20px;">今</div>
+      <div class="chip chip-violet tok-row" id="kc-c1" style="left:68px;">天</div>
+      <div class="chip chip-violet tok-row" id="kc-c2" style="left:116px;">天</div>
+      <div class="chip chip-violet tok-row" id="kc-c3" style="left:164px;">气</div>
+      <div class="chip chip-green tok-row gen-slot" id="kc-g0" style="left:212px;">真</div>
+      <div class="chip chip-green tok-row gen-slot" id="kc-g1" style="left:260px;">好</div>
+      <div class="chip chip-green tok-row gen-slot" id="kc-g2" style="left:308px;">！</div>
+      <div class="reuse-line" id="reuse-line"></div>
+      <span class="reuse-lbl" id="reuse-lbl">↑ 历史 K/V 直接复用，零重算</span>
+      <div class="total-box">
+        <div class="total-label">累计 K/V 计算</div>
+        <div class="total-num" id="kc-total" style="color:var(--green);">0</div>
+        <div class="total-unit">组</div>
+      </div>
+      <p class="lane-note">每步只算新 token 的 1 组 K/V，追加进缓存（紫色 = 缓存命中，绿色 = 本步新增）</p>
+    </div>
+  </div>
+
+  <footer class="hf-caption"><span class="cap-dot"></span><span id="cap-text"></span></footer>
+</div>
+<script src="gsap.min.js"></script>
+<script>
+(function () {
+  var tl = gsap.timeline({ paused: true, defaults: { ease: "power2.inOut" } });
+  var cap = function (t, text) { tl.set("#cap-text", { textContent: text }, t); };
+
+  cap(0, "生成第 t 个 token 时，attention 需要前 t−1 个 token 的 K 和 V");
+  tl.fromTo("#lane-naive", { autoAlpha: 0, y: 18 }, { autoAlpha: 1, y: 0, duration: 0.5 }, 0.2);
+  tl.fromTo("#lane-cache", { autoAlpha: 0, y: 18 }, { autoAlpha: 1, y: 0, duration: 0.5 }, 0.35);
+
+  // 朴素推理：3 步，重算量 4 / 5 / 6
+  var steps = [
+    { t: 1.2, chips: ["#nv-c0", "#nv-c1", "#nv-c2", "#nv-c3"], gen: "#nv-g0", total: "4", lbl: "Step 1 · 生成「真」：重算 4 组 K/V" },
+    { t: 3.0, chips: ["#nv-c0", "#nv-c1", "#nv-c2", "#nv-c3", "#nv-g0"], gen: "#nv-g1", total: "9", lbl: "Step 2 · 生成「好」：重算 5 组 K/V" },
+    { t: 4.8, chips: ["#nv-c0", "#nv-c1", "#nv-c2", "#nv-c3", "#nv-g0", "#nv-g1"], gen: "#nv-g2", total: "15", lbl: "Step 3 · 生成「！」：重算 6 组 K/V" }
+  ];
+  cap(1.2, "朴素做法：每步都把全部历史的 K/V 重算一遍");
+  steps.forEach(function (s) {
+    tl.set("#nv-step", { textContent: s.lbl }, s.t);
+    s.chips.forEach(function (c, i) {
+      tl.fromTo(c, { backgroundColor: "#ffffff", borderColor: "#e4e4e7" },
+        { backgroundColor: "#fef2f2", borderColor: "#fca5a5", duration: 0.18 }, s.t + i * 0.13);
+    });
+    tl.fromTo(s.gen, { autoAlpha: 0, scale: 0.5 }, { autoAlpha: 1, scale: 1, duration: 0.3, ease: "back.out(2)" }, s.t + s.chips.length * 0.13 + 0.15);
+    tl.set("#nv-total", { textContent: s.total }, s.t + s.chips.length * 0.13 + 0.2);
+  });
+  cap(6.2, "序列每长 1，重算多 1 组 —— 累计 4+5+6 = 15 组，整体是 O(N²)");
+  tl.fromTo("#nv-total", { scale: 1 }, { scale: 1.3, duration: 0.35, yoyo: true, repeat: 1 }, 6.4);
+
+  // KV Cache：3 步，每步 +1
+  cap(7.4, "KV Cache：历史 K/V 算过一次就缓存，之后直接复用");
+  tl.to("#reuse-line", { width: 184, duration: 0.5 }, 7.4);
+  tl.to("#reuse-lbl", { autoAlpha: 1, duration: 0.4 }, 7.7);
+  var ksteps = [
+    { t: 8.4, gen: "#kc-g0", total: "1", lbl: "Step 1 · 生成「真」：只算 1 组，追加进缓存" },
+    { t: 9.6, gen: "#kc-g1", total: "2", lbl: "Step 2 · 生成「好」：只算 1 组，追加进缓存" },
+    { t: 10.8, gen: "#kc-g2", total: "3", lbl: "Step 3 · 生成「！」：只算 1 组，追加进缓存" }
+  ];
+  ksteps.forEach(function (s) {
+    tl.set("#kc-step", { textContent: s.lbl }, s.t);
+    tl.fromTo(s.gen, { autoAlpha: 0, x: 24 }, { autoAlpha: 1, x: 0, duration: 0.35, ease: "power2.out" }, s.t + 0.1);
+    tl.set("#kc-total", { textContent: s.total }, s.t + 0.4);
+  });
+  cap(11.6, "15 组 → 3 组：O(N²) → O(N)。这就是为什么所有推理引擎都内置 KV Cache");
+  tl.fromTo("#kc-total", { scale: 1 }, { scale: 1.3, duration: 0.35, yoyo: true, repeat: 1 }, 11.8);
+  tl.to("#scene", { autoAlpha: 0, duration: 0.5 }, 12.5);
+
+  window.__timelines = window.__timelines || {};
+  window.__timelines["naive-vs-kv-cache"] = tl;
+  if (new URLSearchParams(location.search).has("autoplay")) { tl.repeat(-1).play(); }
+})();
+</script>
+</body>
+</html>

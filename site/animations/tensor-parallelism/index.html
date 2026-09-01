@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Tensor Parallelism：切开矩阵乘法</title>
+<meta name="hyperframes:composition" content="tensor-parallelism">
+<meta name="hyperframes:width" content="1280">
+<meta name="hyperframes:height" content="720">
+<meta name="hyperframes:duration" content="13">
+<meta name="hyperframes:fps" content="30">
+<link rel="stylesheet" href="anim.css">
+<style>
+  .gpu { position: absolute; left: 700px; width: 540px; height: 172px; background: var(--panel); border: 1.5px solid var(--line); border-radius: 14px; }
+  #gpu0 { top: 140px; }
+  #gpu1 { top: 386px; }
+  .gpu-name { position: absolute; top: 12px; left: 16px; font-family: var(--mono); font-size: 13px; font-weight: 650; }
+  .gpu-eq { position: absolute; top: 12px; right: 16px; font-family: var(--mono); font-size: 12px; color: var(--mut); }
+  .x-chip { position: absolute; left: 60px; width: 44px; height: 36px; border-radius: 8px; background: var(--blue-bg); border: 1.5px solid #93c5fd; color: #1d4ed8; font-family: var(--mono); font-size: 13px; font-weight: 600; display: flex; align-items: center; justify-content: center; }
+  .w-cell { position: absolute; width: 28px; height: 28px; border-radius: 5px; background: #fff; border: 1px solid #d4d4d8; }
+  .half-overlay { position: absolute; border: 2px solid; border-radius: 10px; opacity: 0; z-index: 3; }
+  .mini-w { position: absolute; width: 64px; height: 64px; border-radius: 10px; display: flex; align-items: center; justify-content: center; font-family: var(--mono); font-size: 12px; font-weight: 650; opacity: 0; z-index: 5; box-shadow: 0 4px 14px rgba(0,0,0,.15); }
+  .y-chip { position: absolute; width: 44px; height: 36px; border-radius: 8px; font-family: var(--mono); font-size: 12px; font-weight: 600; display: flex; align-items: center; justify-content: center; opacity: 0; }
+  .y-blue { background: var(--blue-bg); border: 1.5px solid #93c5fd; color: #1d4ed8; }
+  .y-violet { background: var(--violet-bg); border: 1.5px solid #c4b5fd; color: #6d28d9; }
+  .x-clone { position: absolute; width: 56px; height: 36px; border-radius: 8px; background: #fff; border: 1.5px solid #93c5fd; color: #1d4ed8; font-family: var(--mono); font-size: 12px; font-weight: 600; display: flex; align-items: center; justify-content: center; opacity: 0; z-index: 5; }
+  #result { position: absolute; left: 700px; top: 590px; width: 540px; height: 64px; background: #fff; border: 1.5px solid var(--line); border-radius: 12px; display: flex; align-items: center; padding: 0 16px; gap: 8px; opacity: 0; }
+  #result-eq { font-family: var(--mono); font-size: 13.5px; font-weight: 600; color: var(--ink); }
+  .ar-arrow { position: absolute; font-family: var(--mono); font-size: 11.5px; color: var(--green); opacity: 0; }
+</style>
+</head>
+<body>
+<div id="root" data-composition-id="tensor-parallelism" data-start="0" data-duration="13" data-width="1280" data-height="720">
+  <header class="hf-head">
+    <div class="hf-head-text">
+      <span class="hf-kicker">Chapter 04 · 并行与服务架构</span>
+      <h1 class="hf-title">Tensor Parallelism：把一个矩阵乘法拆到多卡</h1>
+    </div>
+    <span class="hf-chapter">08 / 12</span>
+  </header>
+
+  <div id="scene">
+    <span class="label" style="position:absolute;left:60px;top:196px;">输入 X</span>
+    <div class="x-chip" id="x0" style="top:222px;">x₁</div>
+    <div class="x-chip" id="x1" style="top:266px;">x₂</div>
+    <div class="x-chip" id="x2" style="top:310px;">x₃</div>
+    <div class="x-chip" id="x3" style="top:354px;">x₄</div>
+    <span class="label" style="position:absolute;left:300px;top:166px;">权重 W [d×d]</span>
+    <div id="w-grid"></div>
+    <div class="half-overlay" id="ov-col1" style="left:296px;top:206px;width:98px;height:194px;border-color:var(--blue);"></div>
+    <div class="half-overlay" id="ov-col2" style="left:398px;top:206px;width:98px;height:194px;border-color:var(--violet);"></div>
+    <div class="half-overlay" id="ov-row1" style="left:296px;top:206px;width:200px;height:96px;border-color:var(--blue);"></div>
+    <div class="half-overlay" id="ov-row2" style="left:296px;top:306px;width:200px;height:96px;border-color:var(--violet);"></div>
+
+    <div class="mini-w" id="mw-1" style="left:313px;top:271px;background:var(--blue-bg);border:1.5px solid #93c5fd;color:#1d4ed8;">W₁</div>
+    <div class="mini-w" id="mw-2" style="left:415px;top:271px;background:var(--violet-bg);border:1.5px solid #c4b5fd;color:#6d28d9;">W₂</div>
+
+    <div class="x-clone" id="xc-0" style="left:60px;top:266px;">X</div>
+    <div class="x-clone" id="xc-1" style="left:60px;top:266px;">X</div>
+
+    <div class="gpu" id="gpu0">
+      <span class="gpu-name">GPU 0</span>
+      <span class="gpu-eq" id="eq-0"></span>
+      <div class="y-chip y-blue" id="y0a" style="left:300px;top:66px;">y₁</div>
+      <div class="y-chip y-blue" id="y0b" style="left:352px;top:66px;">y₂</div>
+      <div class="y-chip y-blue" id="y0c" style="left:404px;top:66px;">y₃</div>
+      <div class="y-chip y-violet" id="s0" style="left:300px;top:66px;width:148px;">Y⁽¹⁾ 部分和</div>
+    </div>
+    <div class="gpu" id="gpu1">
+      <span class="gpu-name">GPU 1</span>
+      <span class="gpu-eq" id="eq-1"></span>
+      <div class="y-chip y-violet" id="y1a" style="left:300px;top:66px;">y₄</div>
+      <div class="y-chip y-violet" id="y1b" style="left:352px;top:66px;">y₅</div>
+      <div class="y-chip y-violet" id="y1c" style="left:404px;top:66px;">y₆</div>
+      <div class="y-chip y-blue" id="s1" style="left:300px;top:66px;width:148px;">Y⁽²⁾ 部分和</div>
+    </div>
+
+    <svg width="1280" height="720" style="position:absolute;left:0;top:0;pointer-events:none;z-index:4;">
+      <path id="ar-down" d="M 1000 322 C 1000 352, 960 352, 960 382" fill="none" stroke="#059669" stroke-width="2.5" stroke-dasharray="6 5" opacity="0" marker-end="url(#arr)"/>
+      <path id="ar-up" d="M 1060 386 C 1060 356, 1100 356, 1100 326" fill="none" stroke="#059669" stroke-width="2.5" stroke-dasharray="6 5" opacity="0" marker-end="url(#arr)"/>
+      <defs><marker id="arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 z" fill="#059669"/></marker></defs>
+    </svg>
+    <span class="ar-arrow" id="ar-lbl" style="left:1010px;top:344px;font-weight:600;">All-Reduce Σ</span>
+
+    <div id="result"><span id="result-eq"></span></div>
+  </div>
+
+  <footer class="hf-caption"><span class="cap-dot"></span><span id="cap-text"></span></footer>
+</div>
+<script src="gsap.min.js"></script>
+<script>
+(function () {
+  // W 矩阵 6x6
+  var grid = document.getElementById("w-grid");
+  for (var r = 0; r < 6; r++) {
+    for (var c = 0; c < 6; c++) {
+      var cell = document.createElement("div");
+      cell.className = "w-cell";
+      cell.style.left = 300 + c * 34 + "px";
+      cell.style.top = 210 + r * 32 + "px";
+      grid.appendChild(cell);
+    }
+  }
+  gsap.set("#w-grid", { position: "absolute" });
+
+  var tl = gsap.timeline({ paused: true, defaults: { ease: "power2.inOut" } });
+  var cap = function (t, text) { tl.set("#cap-text", { textContent: text }, t); };
+  var beatA = ["#ov-col1", "#ov-col2"];
+  var resetEls = ["#mw-1", "#mw-2", "#xc-0", "#xc-1", "#y0a", "#y0b", "#y0c", "#y1a", "#y1b", "#y1c", "#s0", "#s1", "#result", "#ar-down", "#ar-up", "#ar-lbl"];
+
+  cap(0, "单卡算不动 / 放不下 → 把 Y = X·W 拆到两张卡上并行");
+  tl.fromTo("#x0, #x1, #x2, #x3", { autoAlpha: 0, x: -14 }, { autoAlpha: 1, x: 0, duration: 0.35, stagger: 0.07 }, 0.3);
+  tl.fromTo(".w-cell", { autoAlpha: 0, scale: 0.5 }, { autoAlpha: 1, scale: 1, duration: 0.25, stagger: { each: 0.015, from: "center" } }, 0.5);
+  tl.fromTo("#gpu0, #gpu1", { autoAlpha: 0, y: 16 }, { autoAlpha: 1, y: 0, duration: 0.4 }, 0.8);
+
+  // ---- Beat A: 列切分 ----
+  cap(1.8, "① 列切分（Column Parallel）：W = [W₁ | W₂]，X 广播到两卡");
+  tl.to("#ov-col1, #ov-col2", { opacity: 1, duration: 0.4 }, 1.8);
+  tl.fromTo("#mw-1", { autoAlpha: 0 }, { autoAlpha: 1, duration: 0.25 }, 2.3);
+  tl.to("#mw-1", { x: 430, y: -85, duration: 0.6 }, 2.5);   // → GPU0
+  tl.fromTo("#mw-2", { autoAlpha: 0 }, { autoAlpha: 1, duration: 0.25 }, 2.6);
+  tl.to("#mw-2", { x: 328, y: 161, duration: 0.6 }, 2.8);   // → GPU1
+  tl.fromTo("#xc-0", { autoAlpha: 0 }, { autoAlpha: 1, duration: 0.2 }, 3.2);
+  tl.to("#xc-0", { x: 770, y: -71, duration: 0.55 }, 3.3);  // X 广播 → GPU0
+  tl.fromTo("#xc-1", { autoAlpha: 0 }, { autoAlpha: 1, duration: 0.2 }, 3.4);
+  tl.to("#xc-1", { x: 770, y: 175, duration: 0.55 }, 3.5);  // X 广播 → GPU1
+  cap(4.2, "各算一半：GPU0 出 y₁..y₃，GPU1 出 y₄..y₆");
+  tl.set("#eq-0", { textContent: "Y₁ = X · W₁" }, 4.2);
+  tl.set("#eq-1", { textContent: "Y₂ = X · W₂" }, 4.2);
+  tl.fromTo("#y0a, #y0b, #y0c", { autoAlpha: 0, scale: 0.5 }, { autoAlpha: 1, scale: 1, duration: 0.3, stagger: 0.08, ease: "back.out(2)" }, 4.4);
+  tl.fromTo("#y1a, #y1b, #y1c", { autoAlpha: 0, scale: 0.5 }, { autoAlpha: 1, scale: 1, duration: 0.3, stagger: 0.08, ease: "back.out(2)" }, 4.7);
+  cap(5.4, "拼接即得 Y = [Y₁ | Y₂] —— 列切分本身无需通信");
+  tl.to("#result", { autoAlpha: 1, duration: 0.3 }, 5.4);
+  tl.set("#result-eq", { textContent: "Y = [ Y₁ | Y₂ ] · 直接拼接（无通信）" }, 5.4);
+
+  // ---- Beat B: 行切分 ----
+  cap(6.8, "② 行切分（Row Parallel）：W 按行切，X 也对应切开");
+  tl.to(resetEls.join(","), { autoAlpha: 0, duration: 0.4 }, 6.8);
+  tl.to("#ov-col1, #ov-col2", { opacity: 0, duration: 0.3 }, 6.8);
+  tl.to("#ov-row1, #ov-row2", { opacity: 1, duration: 0.4 }, 7.3);
+  // mini W 重新从行位置出发
+  tl.set("#mw-1", { x: 3, y: -47 }, 7.4);
+  tl.set("#mw-2", { x: 3, y: 49 }, 7.4);
+  tl.fromTo("#mw-1", { autoAlpha: 0 }, { autoAlpha: 1, duration: 0.25 }, 7.6);
+  tl.to("#mw-1", { x: 430, y: -85, duration: 0.6 }, 7.8);
+  tl.fromTo("#mw-2", { autoAlpha: 0 }, { autoAlpha: 1, duration: 0.25 }, 7.9);
+  tl.to("#mw-2", { x: 328, y: 161, duration: 0.6 }, 8.0);
+  tl.set("#xc-0", { textContent: "X₁" }, 7.6);
+  tl.set("#xc-1", { textContent: "X₂" }, 7.6);
+  tl.fromTo("#xc-0", { autoAlpha: 0 }, { autoAlpha: 1, duration: 0.2 }, 8.2);
+  tl.to("#xc-0", { x: 770, y: -71, duration: 0.55 }, 8.3);
+  tl.fromTo("#xc-1", { autoAlpha: 0 }, { autoAlpha: 1, duration: 0.2 }, 8.4);
+  tl.to("#xc-1", { x: 770, y: 175, duration: 0.55 }, 8.5);
+  cap(9.0, "每卡算出完整形状的部分和：Y⁽¹⁾ = X₁W₁，Y⁽²⁾ = X₂W₂");
+  tl.set("#eq-0", { textContent: "Y⁽¹⁾ = X₁ · W₁" }, 9.0);
+  tl.set("#eq-1", { textContent: "Y⁽²⁾ = X₂ · W₂" }, 9.0);
+  tl.fromTo("#s0", { autoAlpha: 0, scale: 0.6 }, { autoAlpha: 1, scale: 1, duration: 0.35, ease: "back.out(2)" }, 9.2);
+  tl.fromTo("#s1", { autoAlpha: 0, scale: 0.6 }, { autoAlpha: 1, scale: 1, duration: 0.35, ease: "back.out(2)" }, 9.4);
+
+  cap(10.2, "All-Reduce：两卡交换部分和并相加 —— 每个 Transformer 层要付 2 次通信税");
+  tl.to("#ar-down, #ar-up, #ar-lbl", { autoAlpha: 1, duration: 0.4 }, 10.2);
+  tl.fromTo("#ar-down, #ar-up", { strokeDashoffset: 44 }, { strokeDashoffset: 0, duration: 0.9, ease: "none", repeat: 2 }, 10.3);
+  tl.to("#result", { autoAlpha: 1, duration: 0.3 }, 11.2);
+  tl.set("#result-eq", { textContent: "Y = Y⁽¹⁾ + Y⁽²⁾ · All-Reduce 求和" }, 11.2);
+  cap(11.6, "Megatron 切法：QKV / MLP 第一层列切，o_proj / down_proj 行切，每层 2 次 All-Reduce");
+  tl.to("#scene", { autoAlpha: 0, duration: 0.5 }, 12.5);
+
+  window.__timelines = window.__timelines || {};
+  window.__timelines["tensor-parallelism"] = tl;
+  if (new URLSearchParams(location.search).has("autoplay")) { tl.repeat(-1).play(); }
+})();
+</script>
+</body>
+</html>

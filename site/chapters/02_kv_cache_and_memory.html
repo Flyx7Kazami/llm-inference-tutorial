@@ -1,0 +1,607 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>02 · KV Cache 与内存优化 · LLM 推理优化</title>
+<meta name="description" content="KV Cache 的原理与显存开销、PagedAttention、Continuous Batching、MQA / GQA。">
+<link rel="stylesheet" href="../assets/blog.css?v=1788185626">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2318181b'/%3E%3Ctext x='16' y='22' font-family='Menlo,monospace' font-size='17' font-weight='600' fill='%23fafafa' text-anchor='middle'%3E%CE%BB%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<header class="site-header">
+  <div class="container header-inner">
+    <a class="brand" href="../index.html">
+      <span class="brand-mark">λ</span>
+      <span class="brand-name">LLM 推理优化</span>
+    </a>
+    <nav class="site-nav"><a href="../chapters/01_inference_fundamentals.html" title="第 01 章">01</a><a href="../chapters/02_kv_cache_and_memory.html" title="第 02 章">02</a><a href="../chapters/03_quantization.html" title="第 03 章">03</a><a href="../chapters/04_parallelism_and_serving.html" title="第 04 章">04</a><a href="../chapters/05_advanced_techniques.html" title="第 05 章">05</a><a href="../chapters/06_framework_ecosystem.html" title="第 06 章">06</a><a href="../chapters/07_cluster_and_infra.html" title="第 07 章">07</a></nav>
+    <details class="mobile-nav">
+      <summary>章节</summary>
+      <div class="mobile-nav-panel"><a href="../chapters/01_inference_fundamentals.html" title="第 01 章">01</a><a href="../chapters/02_kv_cache_and_memory.html" title="第 02 章">02</a><a href="../chapters/03_quantization.html" title="第 03 章">03</a><a href="../chapters/04_parallelism_and_serving.html" title="第 04 章">04</a><a href="../chapters/05_advanced_techniques.html" title="第 05 章">05</a><a href="../chapters/06_framework_ecosystem.html" title="第 06 章">06</a><a href="../chapters/07_cluster_and_infra.html" title="第 07 章">07</a></div>
+    </details>
+  </div>
+</header>
+<main class="container main-grid">
+  <article class="prose">
+<div class="chapter-head"><div class="breadcrumb"><a href="../index.html">首页</a><span class="sep">/</span>第 02 章</div></div><h1 id="第二章kv-cache-与内存优化-显存都去哪了">第二章：KV Cache 与内存优化 —— 显存都去哪了？</h1>
+<h2 id="1-朴素推理的问题重复计算">1. 朴素推理的问题：重复计算</h2>
+<figure class="anim-figure"><figcaption><span class="anim-badge"><svg viewBox="0 0 24 24" fill="currentColor" width="11" height="11"><path d="M8 5.5v13l11-6.5z"/></svg>动画演示</span><span class="anim-title">朴素推理 vs KV Cache</span><a class="anim-open" href="../animations/naive-vs-kv-cache/index.html?autoplay=1" target="_blank" rel="noopener">新窗口打开<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="11" height="11"><path d="M7 17L17 7M9 7h8v8"/></svg></a></figcaption><div class="anim-embed"><iframe src="../animations/naive-vs-kv-cache/index.html?autoplay=1" title="朴素推理 vs KV Cache" loading="lazy" scrolling="no"></iframe></div><p class="anim-caption">朴素推理每生成一个 token 都要重算全部历史 K/V（O(N²)）；KV Cache 每步只追加一组 K/V，计算量降为 O(N)。</p></figure>
+<p>没有 KV Cache 时，生成第 k 个 token 需要对前 k-1 个 token 全部重新做 attention：</p>
+<div class="codehilite"><pre><span></span><code>生成 token 1: Attention(prompt)           → O(L)
+生成 token 2: Attention(prompt + t1)      → O(L+1)
+生成 token 3: Attention(prompt + t1 + t2) → O(L+2)
+...
+生成 token N: Attention(prompt + t1+...+tN-1) → O(L+N-1)
+
+总计算量 = O(L + (L+1) + ... + (L+N-1)) = O(N·L + N²/2)
+</code></pre></div>
+
+<p><strong>每个新 token 都要对所有之前的 token 重算 Q·K^T 和 softmax·V，这是巨大的浪费。</strong></p>
+<p></p>
+<h2 id="2-kv-cache-原理">2. KV Cache 原理</h2>
+<h3 id="21-核心思想">2.1 核心思想</h3>
+<p>Attention 公式：</p>
+<div class="codehilite"><pre><span></span><code>Attention(Q, K, V) = softmax(QK^T / √d) · V
+</code></pre></div>
+
+<ul>
+<li><strong>Q</strong> 是当前 token 的 query 向量（只跟当前步有关）</li>
+<li><strong>K</strong> 和 <strong>V</strong> 是所有历史 token 的 key/value 向量</li>
+</ul>
+<p>既然 K 和 V 来自前面的 token，且已经算过了，<strong>直接缓存起来</strong>就好！</p>
+<div class="codehilite"><pre><span></span><code>生成 token 1: 计算 K₁,V₁，缓存。用 Q₁ 做注意力。
+生成 token 2: 计算 K₂,V₂，拼入缓存。用 Q₂ 对 [K₁,K₂] 做注意力。
+生成 token 3: 计算 K₃,V₃，拼入缓存。用 Q₃ 对 [K₁,K₂,K₃] 做注意力。
+...
+
+每步只需:
+  1. 计算当前 token 的 Q, K, V（O(d²) 矩阵乘）
+  2. 把新 K, V 追加到缓存
+  3. 用当前 Q 对整个 KV 缓存做 attention（O(L·d)）
+</code></pre></div>
+
+<p>总计算量从 O(N²) 降到 O(N·L) —— 线性！</p>
+<p></p>
+<h3 id="22-代码理解最小示例">2.2 代码理解（最小示例）</h3>
+<div class="codehilite"><pre><span></span><code><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch.nn.functional</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">F</span>
+
+<span class="c1"># 假设: d_model=64, n_heads=4, d_head=16, seq_len=10</span>
+<span class="n">d_model</span><span class="p">,</span> <span class="n">n_heads</span><span class="p">,</span> <span class="n">d_head</span> <span class="o">=</span> <span class="mi">64</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">16</span>
+<span class="n">Wq</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">d_model</span><span class="p">,</span> <span class="n">n_heads</span> <span class="o">*</span> <span class="n">d_head</span><span class="p">)</span>
+<span class="n">Wk</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">d_model</span><span class="p">,</span> <span class="n">n_heads</span> <span class="o">*</span> <span class="n">d_head</span><span class="p">)</span>
+<span class="n">Wv</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">d_model</span><span class="p">,</span> <span class="n">n_heads</span> <span class="o">*</span> <span class="n">d_head</span><span class="p">)</span>
+
+<span class="c1"># Prefill: 处理整个 prompt</span>
+<span class="n">prompt</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">10</span><span class="p">,</span> <span class="n">d_model</span><span class="p">)</span>  <span class="c1"># 10 tokens</span>
+<span class="n">Q</span> <span class="o">=</span> <span class="n">prompt</span> <span class="o">@</span> <span class="n">Wq</span>  <span class="c1"># [10, 64]</span>
+<span class="n">K</span> <span class="o">=</span> <span class="n">prompt</span> <span class="o">@</span> <span class="n">Wk</span>  <span class="c1"># [10, 64]</span>
+<span class="n">V</span> <span class="o">=</span> <span class="n">prompt</span> <span class="o">@</span> <span class="n">Wv</span>  <span class="c1"># [10, 64]</span>
+
+<span class="c1"># 保存 KV Cache</span>
+<span class="n">kv_cache_k</span> <span class="o">=</span> <span class="n">K</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="mi">10</span><span class="p">,</span> <span class="n">n_heads</span><span class="p">,</span> <span class="n">d_head</span><span class="p">)</span>  <span class="c1"># [seq_len, n_heads, d_head]</span>
+<span class="n">kv_cache_v</span> <span class="o">=</span> <span class="n">V</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="mi">10</span><span class="p">,</span> <span class="n">n_heads</span><span class="p">,</span> <span class="n">d_head</span><span class="p">)</span>
+
+<span class="c1"># Decode: 生成一个新 token</span>
+<span class="n">new_token</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">d_model</span><span class="p">)</span>
+<span class="n">Q_new</span> <span class="o">=</span> <span class="n">new_token</span> <span class="o">@</span> <span class="n">Wq</span>  <span class="c1"># [1, 64]</span>
+<span class="n">K_new</span> <span class="o">=</span> <span class="n">new_token</span> <span class="o">@</span> <span class="n">Wk</span>  <span class="c1"># [1, 64]</span>
+<span class="n">V_new</span> <span class="o">=</span> <span class="n">new_token</span> <span class="o">@</span> <span class="n">Wv</span>  <span class="c1"># [1, 64]</span>
+
+<span class="c1"># 追加到 cache</span>
+<span class="n">kv_cache_k</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">([</span><span class="n">kv_cache_k</span><span class="p">,</span> <span class="n">K_new</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">n_heads</span><span class="p">,</span> <span class="n">d_head</span><span class="p">)],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+<span class="n">kv_cache_v</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">([</span><span class="n">kv_cache_v</span><span class="p">,</span> <span class="n">V_new</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">n_heads</span><span class="p">,</span> <span class="n">d_head</span><span class="p">)],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+
+<span class="c1"># Attention: 只用当前 Q，对整个 cache</span>
+<span class="n">Q_h</span> <span class="o">=</span> <span class="n">Q_new</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">n_heads</span><span class="p">,</span> <span class="n">d_head</span><span class="p">)</span>        <span class="c1"># [1, n_heads, d_head]</span>
+<span class="n">attn</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">einsum</span><span class="p">(</span><span class="s1">'qhd,khd-&gt;qhk'</span><span class="p">,</span> <span class="n">Q_h</span><span class="p">,</span> <span class="n">kv_cache_k</span><span class="p">)</span>  <span class="c1"># [1, n_heads, seq_len]</span>
+<span class="n">attn</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">softmax</span><span class="p">(</span><span class="n">attn</span> <span class="o">/</span> <span class="n">d_head</span><span class="o">**</span><span class="mf">0.5</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+<span class="n">output</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">einsum</span><span class="p">(</span><span class="s1">'qhk,khd-&gt;qhd'</span><span class="p">,</span> <span class="n">attn</span><span class="p">,</span> <span class="n">kv_cache_v</span><span class="p">)</span>  <span class="c1"># [1, n_heads, d_head]</span>
+</code></pre></div>
+
+<h2 id="3-kv-cache-的显存开销-这是个大问题">3. KV Cache 的显存开销 —— 这是个大问题</h2>
+<h3 id="31-计算公式">3.1 计算公式</h3>
+<p>对于一层 Transformer 的 KV Cache：</p>
+<div class="codehilite"><pre><span></span><code>KV Cache 大小 = 2 × seq_len × batch_size × n_layers × d_model × dtype_size
+             = 2 × S × B × L × D × sizeof(dtype)
+</code></pre></div>
+
+<ul>
+<li><code>2</code>：K 和 V 各一份</li>
+<li><code>S</code>：序列长度</li>
+<li><code>B</code>：batch size</li>
+<li><code>L</code>：Transformer 层数</li>
+<li><code>D</code>：隐藏维度（d_model）</li>
+<li><code>sizeof(dtype)</code>：数据类型字节数（FP16 = 2, FP32 = 4）</li>
+</ul>
+<div class="widget" id="kv-calc">
+  <div class="widget-head"><span class="widget-badge">交互</span><span class="widget-title">KV Cache 显存计算器</span></div>
+  <div style="font-size:12.5px;color:var(--muted-foreground)">拖动滑杆，直观感受每个因子对显存占用的影响（默认 LLaMA-2-7B + GQA-8）</div>
+  <div class="w-grid">
+    <div class="w-ctl"><label>序列长度 S <output data-o="seq">4096</output></label><input type="range" min="0" max="10" step="1" value="5" data-p="seq" data-log="1"></div>
+    <div class="w-ctl"><label>Batch size B <output data-o="batch">1</output></label><input type="range" min="1" max="256" step="1" value="1" data-p="batch"></div>
+    <div class="w-ctl"><label>层数 L <output data-o="layers">32</output></label><input type="range" min="1" max="80" step="1" value="32" data-p="layers"></div>
+    <div class="w-ctl"><label>KV head 数 n_kv<output data-o="kvheads">8</output></label><input type="range" min="1" max="64" step="1" value="8" data-p="kvheads"></div>
+    <div class="w-ctl"><label>精度</label><select data-p="dtype"><option value="2" selected>FP16 / BF16（2 字节）</option><option value="4">FP32（4 字节）</option><option value="1">INT8（1 字节）</option><option value="0.5">INT4（0.5 字节）</option></select></div>
+  </div>
+  <div class="w-out">
+    <div class="w-stat"><div class="v" data-o="total" style="color:#2563eb">—</div><div class="k">KV Cache 总大小</div></div>
+    <div class="w-stat"><div class="v" data-o="pertok">—</div><div class="k">每 token（全部层，K+V）</div></div>
+    <div class="w-stat"><div class="v" data-o="vs">—</div><div class="k">对比 7B FP16 权重（14 GB）</div></div>
+  </div>
+  <div class="dg-cap" style="text-align:left;margin-top:10px">按 d_head = 128 计（LLaMA 系）；MHA 时 n_kv = n_heads，GQA-8 时 n_kv = 8，MQA 时 n_kv = 1</div>
+</div>
+
+<h3 id="32-算一笔账">3.2 算一笔账</h3>
+<p><strong>LLaMA-2-70B</strong>（80 层，d_model=8192，FP16）：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>序列长度</th>
+<th>Batch=1</th>
+<th>Batch=32</th>
+<th>Batch=128</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>512</td>
+<td>160 MB</td>
+<td>5 GB</td>
+<td>20 GB</td>
+</tr>
+<tr>
+<td>2048</td>
+<td>640 MB</td>
+<td>20 GB</td>
+<td>80 GB</td>
+</tr>
+<tr>
+<td>8192</td>
+<td>2.5 GB</td>
+<td>80 GB</td>
+<td>320 GB</td>
+</tr>
+</tbody>
+</table></div>
+<blockquote class="callout callout-warn">
+<p>⚠️ <strong>算法同学的直觉误区</strong>：你可能觉得"不就是缓存几个向量吗"。但实际上 KV Cache 是推理时显存占用的大头！长序列 + 大 batch 时，KV Cache 远超模型权重本身（140GB）。</p>
+</blockquote>
+<p></p>
+<h3 id="33-显存分配全景">3.3 显存分配全景</h3>
+<div class="dg">
+  <div class="dg-title">70B FP16 推理的显存需求 vs A100 80GB</div>
+  <div style="position:relative">
+    <div class="dg-hbar">
+      <div class="seg seg-red" style="width:79.8%">模型权重 ~140 GB</div>
+      <div class="seg seg-amber" style="width:17.1%">KV Cache ~几十 GB</div>
+      <div class="seg seg-blue" style="width:2.6%"></div>
+      <div class="seg seg-gray" style="width:0.5%"></div>
+    </div>
+    <div style="position:absolute;left:45.5%;top:-8px;bottom:-8px;border-left:2px dashed #18181b"></div>
+    <div style="position:absolute;left:45.5%;top:-26px;transform:translateX(-50%);font-size:11.5px;font-weight:600;white-space:nowrap">A100 80GB 容量线</div>
+  </div>
+  <div class="dg-hbar-legend" style="margin-top:34px">
+    <span><span class="sw" style="background:#f87171"></span>模型权重（70B FP16）~140 GB —— 光权重就超了</span>
+    <span><span class="sw" style="background:#fbbf24"></span>KV Cache ~几十 GB —— 随序列/batch 增长</span>
+    <span><span class="sw" style="background:#60a5fa"></span>激活值 ~几 GB</span>
+    <span><span class="sw" style="background:#a1a1aa"></span>框架开销 ~几百 MB</span>
+  </div>
+</div>
+
+<p>这里有两个<strong>不同层面</strong>的显存问题，千万别混淆：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>问题</th>
+<th>原因</th>
+<th>解法</th>
+<th>在哪章讲？</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>单卡放不下模型</strong></td>
+<td>权重 140GB &gt; 80GB</td>
+<td>量化（减权重大小）、张量并行（切到多卡）</td>
+<td>第 3 章、第 4 章</td>
+</tr>
+<tr>
+<td><strong>KV Cache 占满剩余显存</strong></td>
+<td>长序列×大 batch 时 KV Cache 巨大</td>
+<td>PagedAttention、KV 压缩、GQA</td>
+<td>本章</td>
+</tr>
+</tbody>
+</table></div>
+<blockquote class="callout callout-tip">
+<p>💡 <strong>关键区分</strong>：PagedAttention 解决的是 KV Cache 的<strong>显存碎片</strong>问题（分配了但用不满的浪费），而不是让总需求变小。70B 模型的 140GB 权重不会因为 PagedAttention 就能塞进 80GB 的卡——这需要量化或并行。</p>
+</blockquote>
+<h2 id="4-推理系统层面的-kv-cache-优化">4. 推理系统层面的 KV Cache 优化</h2>
+<blockquote class="callout">
+<p>以下优化<strong>不改模型结构</strong>，只改推理引擎的显存管理和调度策略，属于推理系统优化。</p>
+</blockquote>
+<h3 id="41-pagedattentionvllm-的核心创新">4.1 PagedAttention（vLLM 的核心创新）</h3>
+<figure class="anim-figure"><figcaption><span class="anim-badge"><svg viewBox="0 0 24 24" fill="currentColor" width="11" height="11"><path d="M8 5.5v13l11-6.5z"/></svg>动画演示</span><span class="anim-title">PagedAttention：像操作系统一样管理显存</span><a class="anim-open" href="../animations/paged-attention/index.html?autoplay=1" target="_blank" rel="noopener">新窗口打开<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="11" height="11"><path d="M7 17L17 7M9 7h8v8"/></svg></a></figcaption><div class="anim-embed"><iframe src="../animations/paged-attention/index.html?autoplay=1" title="PagedAttention：像操作系统一样管理显存" loading="lazy" scrolling="no"></iframe></div><p class="anim-caption">逻辑块经 Block Table 映射到非连续物理块，按需分配、用满再申请，显存浪费从 60–80% 降到 &lt;4%。</p></figure>
+<p></p>
+<p><strong>问题</strong>：传统做法为每个请求预分配最大长度的连续 KV Cache（如 2048 tokens），但大多数请求用不了这么长 → 大量浪费（内部碎片）。</p>
+<div class="dg">
+  <div class="dg-title">传统方式：按最大长度预分配 → 内部碎片</div>
+  <div class="dg-lanes">
+    <div class="dg-row"><span class="dg-lab">请求 A</span><span class="dg-cells"><i class="c-blue grow">有效</i><i class="c-blue grow">有效</i><i class="c-blue grow">有效</i><i class="c-pad grow">空</i><i class="c-pad grow">空</i><i class="c-pad grow">空</i><i class="c-pad grow">空</i><i class="c-pad grow">空</i></span><span class="pill pill-red">浪费 5/8</span></div>
+    <div class="dg-row"><span class="dg-lab">请求 B</span><span class="dg-cells"><i class="c-green grow">有效</i><i class="c-green grow">有效</i><i class="c-pad grow">空</i><i class="c-pad grow">空</i><i class="c-pad grow">空</i><i class="c-pad grow">空</i><i class="c-pad grow">空</i><i class="c-pad grow">空</i></span><span class="pill pill-red">浪费 6/8</span></div>
+    <div class="dg-row"><span class="dg-lab">请求 C</span><span class="dg-cells"><i class="c-amber grow">有效</i><i class="c-amber grow">有效</i><i class="c-amber grow">有效</i><i class="c-amber grow">有效</i><i class="c-amber grow">有效</i><i class="c-pad grow">空</i><i class="c-pad grow">空</i><i class="c-pad grow">空</i></span><span class="pill pill-red">浪费 3/8</span></div>
+  </div>
+</div>
+
+<p><strong>PagedAttention 的做法</strong>：借鉴操作系统的虚拟内存分页机制</p>
+<ol>
+<li>KV Cache 被分成固定大小的 <strong>block</strong>（如每 block 存 16 个 token 的 KV）</li>
+<li>用 <strong>block table</strong>（页表）映射逻辑位置 → 物理 block</li>
+<li>block 不需要连续，按需分配</li>
+</ol>
+<div class="dg">
+  <div class="dg-title">PagedAttention：逻辑块 → 物理块，按需分配、分散存储</div>
+  <div class="dg-lanes">
+    <div class="dg-row"><span class="dg-lab">物理 Block 池</span><span class="dg-cells"><i class="c-blue">A0</i><i class="c-blue">A1</i><i class="c-green">B0</i><i class="c-amber">C0</i><i class="c-blue">A2</i><i class="c-amber">C1</i><i class="c-amber">C2</i><i class="c-pad">空</i><i class="c-pad">空</i></span></div>
+    <div class="dg-row"><span class="dg-lab">A 的 block table</span><span class="dg-cells"><i class="c-idle">逻辑 0</i>→<i class="c-blue">#0</i><i class="c-idle">逻辑 1</i>→<i class="c-blue">#1</i><i class="c-idle">逻辑 2</i>→<i class="c-blue">#4</i></span></div>
+    <div class="dg-row"><span class="dg-lab">B 的 block table</span><span class="dg-cells"><i class="c-idle">逻辑 0</i>→<i class="c-green">#2</i></span></div>
+    <div class="dg-row"><span class="dg-lab">C 的 block table</span><span class="dg-cells"><i class="c-idle">逻辑 0</i>→<i class="c-amber">#3</i><i class="c-idle">逻辑 1</i>→<i class="c-amber">#5</i><i class="c-idle">逻辑 2</i>→<i class="c-amber">#6</i></span></div>
+  </div>
+  <div class="dg-cap">物理块无需连续，用完再申请 → 几乎零浪费，显存利用率接近 100%</div>
+</div>
+
+<p><strong>效果</strong>：vLLM 论文报告，相比传统连续分配，PagedAttention 将显存浪费从 60-80% 降到 &lt;4%，同等显存下吞吐提升 2-4x。</p>
+<h3 id="411-补充batch-内-kv-cache-的对齐问题">4.1.1 补充：Batch 内 KV Cache 的对齐问题</h3>
+<p>Batched decode 时，不同请求的 KV Cache 长度不同，组成张量时必须对齐。传统做法和 PagedAttention 解决这个问题的方式完全不同：</p>
+<p><strong>传统做法：Left Padding</strong></p>
+<div class="dg">
+  <div class="dg-lanes">
+    <div class="dg-row"><span class="dg-lab">请求 A（3 tokens）</span><span class="dg-cells"><i class="c-pad">PAD</i><i class="c-pad">PAD</i><i class="c-blue">k1</i><i class="c-blue">k2</i><i class="c-blue">k3</i><i class="c-dark">Q</i></span></div>
+    <div class="dg-row"><span class="dg-lab">请求 B（5 tokens）</span><span class="dg-cells"><i class="c-green">k1</i><i class="c-green">k2</i><i class="c-green">k3</i><i class="c-green">k4</i><i class="c-green">k5</i><i class="c-dark">Q</i></span></div>
+  </div>
+  <div class="dg-cap">Left padding 保证当前 token（Q）都在最右侧对齐 → causal mask 统一处理，PAD 位 attention weight 设为 -inf</div>
+</div>
+
+<p>为什么必须是 <strong>left</strong> padding？如果是 right padding：</p>
+<div class="dg">
+  <div class="dg-lanes">
+    <div class="dg-row"><span class="dg-lab">请求 A</span><span class="dg-cells"><i class="c-blue">k1</i><i class="c-blue">k2</i><i class="c-blue">k3</i><i class="c-pad">PAD</i><i class="c-pad">PAD</i><i class="c-red" style="border-width:2px">Q 在 pos 2</i></span></div>
+    <div class="dg-row"><span class="dg-lab">请求 B</span><span class="dg-cells"><i class="c-green">k1</i><i class="c-green">k2</i><i class="c-green">k3</i><i class="c-green">k4</i><i class="c-green">k5</i><i class="c-red" style="border-width:2px">Q 在 pos 4</i></span></div>
+  </div>
+  <div class="dg-cap">Right padding → Q 位置错开，causal mask 无法统一 → attention score 算错</div>
+</div>
+
+<p><strong>PagedAttention：Block Table + 自定义 Kernel</strong></p>
+<p>PagedAttention 不是只改了显存管理——它<strong>必须配套自定义 CUDA kernel</strong>，否则 block table 存了也没用。</p>
+<p>为什么？因为标准 attention kernel（cuBLAS）要求输入是 <code>[batch, max_seq_len, d_model]</code> 的连续密集张量，如果用标准 kernel，block table 里的 KV 还是得 padding 拼回密集张量才能算，那 block table 就只剩省预分配的好处了。</p>
+<p>PagedAttention 的自定义 kernel 跳过了"拼张量"这一步：</p>
+<div class="codehilite"><pre><span></span><code>标准 kernel 的流程：
+  KV Cache → left padding 拼成 [batch, max_seq, d] 密集张量 → cuBLAS 矩阵乘
+
+PagedAttention kernel 的流程：
+  KV Cache 分散在各个 block 中
+  → kernel 通过 block table 间接寻址，直接从 block 读 KV
+  → 每个 warp 处理一个请求，按实际 seq_len 计算 attention
+  → 从头到尾不存在 [batch, max_seq, d] 这个密集张量
+  → 不需要 padding
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code>具体执行（以 batch=2 为例）：
+  请求A 的 block table: [block0][block1]         → seq_len=3
+  请求B 的 block table: [block3][block5][block7]  → seq_len=5
+
+  Warp 0 处理请求A：
+    读 block0 → [k1,k2], 读 block1 → [k3]
+    Q_A 对 [k1,k2,k3] 做 attention（实际 seq_len=3）
+  Warp 1 处理请求B：
+    读 block3 → [k1,k2], 读 block5 → [k3,k4], 读 block7 → [k5]
+    Q_B 对 [k1,k2,k3,k4,k5] 做 attention（实际 seq_len=5）
+
+  → 两个 warp 独立执行，不需要对齐到同一长度
+</code></pre></div>
+
+<blockquote class="callout callout-warn">
+<p>⚠️ 这也是 PagedAttention 工程难度高的原因：它不只是换了个显存管理策略，还必须写一个全新的 attention kernel 来配合。只改显存管理、不改 kernel，计算时还是得 padding 回密集张量。</p>
+</blockquote>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>方案</th>
+<th>显存管理</th>
+<th>计算 kernel</th>
+<th>是否需要 padding</th>
+<th>实现复杂度</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>传统 batched decode</td>
+<td>连续预分配</td>
+<td>标准 kernel（cuBLAS）</td>
+<td>需要 left padding</td>
+<td>低</td>
+</tr>
+<tr>
+<td>只改显存管理，不改 kernel</td>
+<td>Block table</td>
+<td>标准 kernel（cuBLAS）</td>
+<td>还是得 padding 拼回去</td>
+<td>中</td>
+</tr>
+<tr>
+<td><strong>PagedAttention</strong></td>
+<td>Block table</td>
+<td><strong>自定义 kernel</strong></td>
+<td><strong>不需要</strong></td>
+<td>高</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="42-kv-cache-压缩-淘汰">4.2 KV Cache 压缩 / 淘汰</h3>
+<p>长上下文时 KV Cache 太大，一些方法在推理时动态缩减：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>方法</th>
+<th>思路</th>
+<th>效果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Sliding Window Attention</td>
+<td>只保留最近 W 个 token 的 KV</td>
+<td>显存固定，但丢失远距离信息</td>
+</tr>
+<tr>
+<td>StreamingLLM</td>
+<td>保留 sink tokens（前几个）+ 滑动窗口</td>
+<td>稳定且省显存</td>
+</tr>
+<tr>
+<td>H2O (Heavy-Hitter Oracle)</td>
+<td>淘汰 attention score 低的 KV</td>
+<td>保留重要 KV，质量损失小</td>
+</tr>
+<tr>
+<td>Scissorhands</td>
+<td>类似 H2O，基于重要性评分删减</td>
+<td>20% KV 保留 95% 质量</td>
+</tr>
+<tr>
+<td>KV Cache 量化</td>
+<td>KV 存成 INT8/INT4</td>
+<td>显存减半/减 3/4，质量损失可控</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="43-continuous-batching连续批处理">4.3 Continuous Batching（连续批处理）</h3>
+<figure class="anim-figure"><figcaption><span class="anim-badge"><svg viewBox="0 0 24 24" fill="currentColor" width="11" height="11"><path d="M8 5.5v13l11-6.5z"/></svg>动画演示</span><span class="anim-title">Continuous Batching：迭代级调度</span><a class="anim-open" href="../animations/continuous-batching/index.html?autoplay=1" target="_blank" rel="noopener">新窗口打开<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="11" height="11"><path d="M7 17L17 7M9 7h8v8"/></svg></a></figcaption><div class="anim-embed"><iframe src="../animations/continuous-batching/index.html?autoplay=1" title="Continuous Batching：迭代级调度" loading="lazy" scrolling="no"></iframe></div><p class="anim-caption">静态批处理中先完成的请求空占 slot；连续批处理在每个 iteration 边界完成即补位，GPU 不空转。</p></figure>
+<h4 id="431-static-batching-的问题">4.3.1 Static Batching 的问题</h4>
+<div class="dg">
+  <div class="dg-lanes">
+    <div class="dg-row"><span class="dg-lab">请求 A</span><span class="dg-cells"><i class="c-blue">gen</i><i class="c-blue">gen</i><i class="c-blue">gen</i><i class="c-blue">gen</i><i class="c-blue">gen</i><i class="c-dark">结束</i></span><span class="dg-note-line">已结束，但等别的</span></div>
+    <div class="dg-row"><span class="dg-lab">请求 B</span><span class="dg-cells"><i class="c-green">gen</i><i class="c-green">gen</i><i class="c-green">gen</i><i class="c-dark">结束</i><i class="c-pad">空</i><i class="c-pad">空</i></span><span class="dg-note-line">已结束，空转</span></div>
+    <div class="dg-row"><span class="dg-lab">请求 C</span><span class="dg-cells"><i class="c-amber">gen</i><i class="c-amber">gen</i><i class="c-amber">gen</i><i class="c-amber">gen</i><i class="c-amber">gen</i><i class="c-amber">gen</i></span><span class="dg-note-line">还在生成</span></div>
+  </div>
+  <div class="dg-cap">A 和 B 完成后空占 slot，浪费算力</div>
+</div>
+
+<h4 id="432-continuous-batchingiteration-level-scheduling">4.3.2 Continuous Batching（Iteration-level Scheduling）</h4>
+<div class="dg">
+  <div class="dg-lanes">
+    <div class="dg-row"><span class="dg-lab">迭代 1</span><span class="dg-cells"><i class="c-blue">A</i><i class="c-green">B</i><i class="c-amber">C</i></span></div>
+    <div class="dg-row"><span class="dg-lab">迭代 2</span><span class="dg-cells"><i class="c-blue">A</i><i class="c-green">B</i><i class="c-amber">C</i></span></div>
+    <div class="dg-row"><span class="dg-lab">迭代 3</span><span class="dg-cells"><i class="c-blue">A</i><i class="c-green">B</i><i class="c-amber">C</i></span></div>
+    <div class="dg-row"><span class="dg-lab">迭代 4</span><span class="dg-cells"><i class="c-blue">A</i><i class="c-dark">B 结束</i><i class="c-amber">C</i></span><span class="dg-note-line">B 完成，新请求 D 填入 ↓</span></div>
+    <div class="dg-row"><span class="dg-lab">迭代 5</span><span class="dg-cells"><i class="c-blue">A</i><i class="c-violet">D</i><i class="c-amber">C</i></span></div>
+    <div class="dg-row"><span class="dg-lab">迭代 6</span><span class="dg-cells"><i class="c-dark">A 结束</i><i class="c-violet">D</i><i class="c-amber">C</i></span><span class="dg-note-line">A 完成，新请求 E 填入 ↓</span></div>
+  </div>
+  <div class="dg-cap">每个 iteration 边界都可插入新请求、移除已完成请求 → GPU 不空转，利用率显著提升</div>
+</div>
+
+<p>这是 Orca 论文提出的，被 vLLM、TGI 等框架广泛采用。</p>
+<h4 id="433-continuous-batching-的关键问题prefill-干扰-decode">4.3.3 Continuous Batching 的关键问题：Prefill 干扰 Decode</h4>
+<p>新请求插入时需要先做 <strong>Prefill</strong>，但 Prefill 是 compute-bound 的，会拖慢同一 iteration 里其他请求的 Decode：</p>
+<div class="dg">
+  <div class="dg-lanes">
+    <div class="dg-row"><span class="dg-lab">迭代 N</span><span class="dg-cells"><i class="c-green">decode A</i><i class="c-green">decode B</i><i class="c-green">decode C</i></span><span class="dg-note-line">正常 decode</span></div>
+    <div class="dg-row"><span class="dg-lab">迭代 N+1</span><span class="dg-cells"><i class="c-red">prefill D · 512 tok</i><i class="c-green">decode A</i><i class="c-green">decode B</i><i class="c-green">decode C</i></span></div>
+    <div class="dg-row"><span class="dg-lab">迭代 N+2</span><span class="dg-cells"><i class="c-green">decode A</i><i class="c-green">decode B</i><i class="c-green">decode C</i><i class="c-green">decode D</i></span><span class="dg-note-line">D 加入 decode</span></div>
+  </div>
+  <div class="dg-cap">N+1 里 prefill D 是 compute-bound，吃掉大量算力 → A/B/C 的 decode 全部被拖慢</div>
+</div>
+
+<p>这就引出了一个自然的想法：<strong>能不能把 Prefill 和 Decode 放到不同的 GPU 上？</strong></p>
+<div class="codehilite"><pre><span></span><code>请求流程：
+  用户请求 → [请求队列] → Prefill 实例（compute-bound）→ KV Cache 传输 → Decode 实例（memory-bound）→ 返回
+
+这就是 PD 分离架构（第四章 4.3 节详解）。
+</code></pre></div>
+
+<blockquote class="callout callout-tip">
+<p>💡 所以 Continuous Batching 和 PD 分离不是互斥的，而是递进关系：Continuous Batching 解决了"已完成的请求浪费 slot"的问题，但引入了"prefill 干扰 decode"的新问题；PD 分离则进一步解决了这个问题。</p>
+</blockquote>
+<h2 id="5-模型结构层面的-kv-cache-优化">5. 模型结构层面的 KV Cache 优化</h2>
+<blockquote class="callout">
+<p>以下优化<strong>改了模型结构本身</strong>，训练时就决定了，不能在已有模型上事后追加。</p>
+</blockquote>
+<h3 id="51-multi-query-attention-mqa-grouped-query-attention-gqa">5.1 Multi-Query Attention (MQA) &amp; Grouped-Query Attention (GQA)</h3>
+<figure class="anim-figure"><figcaption><span class="anim-badge"><svg viewBox="0 0 24 24" fill="currentColor" width="11" height="11"><path d="M8 5.5v13l11-6.5z"/></svg>动画演示</span><span class="anim-title">MHA / GQA / MQA：共享 K/V 的取舍</span><a class="anim-open" href="../animations/mha-gqa-mqa/index.html?autoplay=1" target="_blank" rel="noopener">新窗口打开<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="11" height="11"><path d="M7 17L17 7M9 7h8v8"/></svg></a></figcaption><div class="anim-embed"><iframe src="../animations/mha-gqa-mqa/index.html?autoplay=1" title="MHA / GQA / MQA：共享 K/V 的取舍" loading="lazy" scrolling="no"></iframe></div><p class="anim-caption">多个 Q 头共享同一组 K/V，KV Cache 成倍缩小；注意力多样性主要来自 Q 的多样性，而非 K/V。</p></figure>
+<p>标准 Multi-Head Attention：</p>
+<div class="codehilite"><pre><span></span><code>每个 head 各有自己的 K 和 V
+→ n_heads 组 K, V
+→ KV Cache 大
+</code></pre></div>
+
+<p>Multi-Query Attention（MQA）：</p>
+<div class="codehilite"><pre><span></span><code>所有 head 共享同一组 K 和 V（只有 1 组）
+→ KV Cache 缩小 n_heads 倍！
+→ 质量有一定损失，但推理速度大幅提升
+</code></pre></div>
+
+<p>Grouped-Query Attention（GQA）：</p>
+<div class="codehilite"><pre><span></span><code>折中方案：n_heads 个 head 分成 n_groups 组，每组共享 K, V
+→ KV Cache 缩小 (n_heads / n_groups) 倍
+→ 质量损失更小
+</code></pre></div>
+
+<div class="dg">
+  <div class="dg-heads">
+    <div class="dg-hrow"><span class="dg-hlab">MHA · Q</span><i class="h-q">1</i><i class="h-q">2</i><i class="h-q">3</i><i class="h-q">4</i><i class="h-q">5</i><i class="h-q">6</i><i class="h-q">7</i><i class="h-q">8</i><span class="hsub">8 个 head 各自有 K,V → <b>8 组 KV</b></span></div>
+    <div class="dg-hrow"><span class="dg-hlab">K / V</span><i class="h-k">1</i><i class="h-k">2</i><i class="h-k">3</i><i class="h-k">4</i><i class="h-k">5</i><i class="h-k">6</i><i class="h-k">7</i><i class="h-k">8</i></div>
+    <div style="height:8px"></div>
+    <div class="dg-hrow"><span class="dg-hlab">GQA · Q</span><i class="h-q">1</i><i class="h-q">2</i><i class="h-q">3</i><i class="h-q">4</i><i class="h-q">5</i><i class="h-q">6</i><i class="h-q">7</i><i class="h-q">8</i><span class="hsub">8 个 head 分 4 组 → <b>4 组 KV</b></span></div>
+    <div class="dg-hrow"><span class="dg-hlab">K / V</span><i class="h-k w" style="width:56px">1-2</i><i class="h-k w" style="width:56px">3-4</i><i class="h-k w" style="width:56px">5-6</i><i class="h-k w" style="width:56px">7-8</i></div>
+    <div style="height:8px"></div>
+    <div class="dg-hrow"><span class="dg-hlab">MQA · Q</span><i class="h-q">1</i><i class="h-q">2</i><i class="h-q">3</i><i class="h-q">4</i><i class="h-q">5</i><i class="h-q">6</i><i class="h-q">7</i><i class="h-q">8</i><span class="hsub">8 个 head 共享 → <b>1 组 KV</b></span></div>
+    <div class="dg-hrow"><span class="dg-hlab">K / V</span><i class="h-k w" style="width:236px">全部 head 共享</i></div>
+  </div>
+</div>
+
+<p>LLaMA-2 70B 用 GQA（8组），LLaMA-3 也用 GQA。</p>
+<h3 id="52-mqa-为什么比-single-head-好">5.2 MQA 为什么比 Single Head 好？</h3>
+<p>一个自然的疑问：MQA 所有 head 共享同一组 K,V，这和 single head attention 有什么区别？为什么不直接用 single head？</p>
+<p><strong>关键区别：MQA 保留了多头的 Q，所以每个 head 有不同的"视角"。</strong></p>
+<div class="codehilite"><pre><span></span><code>Single Head:
+  1 个 Q, 1 个 K, 1 个 V
+  → 1 个 attention pattern
+  → 表征能力 = d_head
+
+MQA:
+  n_heads 个 Q, 1 个 K, 1 个 V
+  → n_heads 个不同的 attention pattern！
+  → 每个 head 用不同的 Q 去"看"同一组 K,V
+  → 表征能力 = n_heads × d_head（和 MHA 一样大）
+</code></pre></div>
+
+<p>类比：K,V 就像一本教科书（内容固定），不同的 Q 就像不同学科的学生（问题视角不同）：</p>
+<ul>
+<li>物理学生（Q₁）看这本书，关注力学部分</li>
+<li>数学学生（Q₂）看同一本书，关注公式部分</li>
+<li>历史学生（Q₃）看同一本书，关注背景部分</li>
+</ul>
+<p><strong>书（K,V）只有一本，但每个学生（Q）从中提取的信息不同</strong>。这就是 MQA 的核心洞察：<strong>注意力多样性主要来自 Q 的多样性，而非 K/V 的多样性</strong>。</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>方案</th>
+<th>Q 数量</th>
+<th>K/V 数量</th>
+<th>KV Cache 大小</th>
+<th>表征能力</th>
+<th>质量损失</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Single Head</td>
+<td>1</td>
+<td>1</td>
+<td>最小</td>
+<td>d_head</td>
+<td>巨大（10%+）</td>
+</tr>
+<tr>
+<td>MQA</td>
+<td>n_heads</td>
+<td>1</td>
+<td>小（1/n_heads）</td>
+<td>n_heads × d_head</td>
+<td>小（1-3%）</td>
+</tr>
+<tr>
+<td>GQA</td>
+<td>n_heads</td>
+<td>n_groups</td>
+<td>中（n_groups/n_heads）</td>
+<td>n_heads × d_head</td>
+<td>极小（&lt;1%）</td>
+</tr>
+<tr>
+<td>MHA</td>
+<td>n_heads</td>
+<td>n_heads</td>
+<td>大</td>
+<td>n_heads × d_head</td>
+<td>基线</td>
+</tr>
+</tbody>
+</table></div>
+<blockquote class="callout callout-tip">
+<p>💡 MQA 的质量损失远小于退化为 single head，因为它保留了多头带来的表达力，只牺牲了 K/V 的多样性。GQA 进一步减少损失，是目前的主流选择。</p>
+</blockquote>
+<h2 id="6-优化全景图">6. 优化全景图</h2>
+<div class="dg dg-tree">
+  <ul>
+    <li><span class="root">KV Cache 显存问题</span>
+      <ul>
+        <li><span class="em">推理系统优化</span> <span class="dim">不改模型，可事后部署</span>
+          <ul>
+            <li><b>PagedAttention</b> → 消除显存碎片，利用率 60%→96%</li>
+            <li><b>KV Cache 压缩/淘汰</b> → 裁剪不重要的 KV</li>
+            <li><b>Continuous Batching</b> → 提升 GPU 利用率
+              <ul><li><span class="dim">带来新问题：Prefill 干扰 Decode → PD 分离（第 4 章）</span></li></ul>
+            </li>
+          </ul>
+        </li>
+        <li><span class="em">模型结构优化</span> <span class="dim">改模型，训练时决定</span>
+          <ul>
+            <li><b>MQA</b> → KV Cache 缩小 n_heads 倍，质量损失 1-3%</li>
+            <li><b>GQA</b> → KV Cache 缩小 n_heads/n_groups 倍，质量损失 &lt;1%</li>
+          </ul>
+        </li>
+        <li><span class="em">根本解法</span> <span class="dim">第 3、4 章</span>
+          <ul>
+            <li><b>量化</b> → 模型权重 + KV Cache 都缩小</li>
+            <li><b>张量并行</b> → 模型切到多卡</li>
+          </ul>
+        </li>
+      </ul>
+    </li>
+  </ul>
+</div>
+
+<h2 id="思考题">思考题</h2>
+<ol class="quiz-list"><li>为什么 prefill 阶段不太需要关心 KV Cache 的显存？<details class="answer"><summary>参考答案</summary><p>两个层面：① Prefill 之前还没有 KV Cache，自然不存在显存问题；② 更重要的是，prefill 是 compute-bound，瓶颈在算力不在显存带宽，KV Cache 省不省、碎片不碎片，对 prefill 速度几乎没影响。真正的受害者是 decode——memory-bound，KV Cache 的大小直接决定每步要读多少数据。</p></details></li><li>PagedAttention 和操作系统的虚拟内存分页，对应关系是什么？（页表、缺页中断、物理块...）<details class="answer"><summary>参考答案</summary><div class="table-wrap"><table>
+<thead>
+<tr>
+<th>操作系统概念</th>
+<th>PagedAttention 对应</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>虚拟地址空间</td>
+<td>请求的逻辑 KV 位置（0, 1, 2, ...）</td>
+</tr>
+<tr>
+<td>物理页帧</td>
+<td>GPU 上的物理 block</td>
+</tr>
+<tr>
+<td>页表</td>
+<td>Block table</td>
+</tr>
+<tr>
+<td>缺页中断</td>
+<td>新 token 超出已分配 block → 分配新 block</td>
+</tr>
+<tr>
+<td>换页（swap to disk）</td>
+<td>block 换出到 CPU 内存（GPU 显存不够时）</td>
+</tr>
+</tbody>
+</table></div></details></li><li>GQA 中 group 数量如何影响推理速度和模型质量？为什么 MQA 没有成为主流？<details class="answer"><summary>参考答案</summary><p>Group 越少 → KV Cache 越小 → 推理越快，但质量下降。MQA 没成主流除了质量损失（1-3%）外，还有一个原因：MQA 相比 GQA 的速度优势边际递减。Decode 阶段的内存访问不只是 KV Cache，还有模型权重。KV Cache 从 1/4（GQA-8组）再降到 1/32（MQA），省的只是 KV 部分，权重读取不变，整体加速没有数字看起来那么大，但质量损失却显著。</p></details></li><li>如果一个模型的 MHA 有 32 个 head，改成 GQA(8 组) 后，KV Cache 节省了多少？Decode 阶段的 memory-bound 瓶颈缓解了多少？<details class="answer"><summary>参考答案</summary><p>KV Cache 变成 1/4（32→8 组，缩小 32/8=4 倍）✅。但不是"总 memory 变成 1/4"。Decode 每步读的内存 = 模型权重 + KV Cache。GQA 后模型权重读取不变（还是读 140GB），只有 KV Cache 部分变成 1/4。实际加速取决于 KV Cache 占总内存读取的比例：短序列（KV Cache 小，权重占主导）→ 加速不明显；长序列（KV Cache 大，可能超过权重）→ 加速显著。</p></details></li><li>Continuous Batching 中，新请求的 prefill 为什么会干扰已有请求的 decode？PD 分离是如何解决这个问题的？<details class="answer"><summary>参考答案</summary><p>新请求插入时需要先 prefill，prefill 是 compute-bound，吃掉大量算力，拖慢同一 iteration 里其他请求的 decode。PD 分离不是"提前算好 prefill"，而是<strong>解耦</strong>——让 prefill 和 decode 跑在不同的 GPU 上，各算各的，互不干扰。Decode 实例永远不会被 prefill 打断，TPOT 更稳定可预测。</p></details></li></ol>
+
+
+<hr>
+<p><em>下一章：<a href="03_quantization.html">03_quantization.md</a> —— KV Cache 省了显存碎片，那模型权重 140GB 怎么办？量化登场。</em></p><nav class="pager"><a class="pager-card" href="01_inference_fundamentals.html"><span class="pager-dir">← 上一章</span><span class="pager-title">01 · LLM 推理基础</span></a><a class="pager-card pager-next" href="03_quantization.html"><span class="pager-dir">下一章 →</span><span class="pager-title">03 · 量化</span></a></nav>
+  </article>
+  <aside class="toc"><div class="toc-title">本页目录</div><ul class="toc-list"><li class="toc-l1"><a href="#第二章kv-cache-与内存优化-显存都去哪了" data-toc-link>第二章：KV Cache 与内存优化 —— 显存都去哪了？</a><ul class="toc-list"><li class="toc-l2"><a href="#1-朴素推理的问题重复计算" data-toc-link>1. 朴素推理的问题：重复计算</a></li><li class="toc-l2"><a href="#2-kv-cache-原理" data-toc-link>2. KV Cache 原理</a><ul class="toc-list"><li class="toc-l3"><a href="#21-核心思想" data-toc-link>2.1 核心思想</a></li><li class="toc-l3"><a href="#22-代码理解最小示例" data-toc-link>2.2 代码理解（最小示例）</a></li></ul></li><li class="toc-l2"><a href="#3-kv-cache-的显存开销-这是个大问题" data-toc-link>3. KV Cache 的显存开销 —— 这是个大问题</a><ul class="toc-list"><li class="toc-l3"><a href="#31-计算公式" data-toc-link>3.1 计算公式</a></li><li class="toc-l3"><a href="#32-算一笔账" data-toc-link>3.2 算一笔账</a></li><li class="toc-l3"><a href="#33-显存分配全景" data-toc-link>3.3 显存分配全景</a></li></ul></li><li class="toc-l2"><a href="#4-推理系统层面的-kv-cache-优化" data-toc-link>4. 推理系统层面的 KV Cache 优化</a><ul class="toc-list"><li class="toc-l3"><a href="#41-pagedattentionvllm-的核心创新" data-toc-link>4.1 PagedAttention（vLLM 的核心创新）</a></li><li class="toc-l3"><a href="#411-补充batch-内-kv-cache-的对齐问题" data-toc-link>4.1.1 补充：Batch 内 KV Cache 的对齐问题</a></li><li class="toc-l3"><a href="#42-kv-cache-压缩-淘汰" data-toc-link>4.2 KV Cache 压缩 / 淘汰</a></li><li class="toc-l3"><a href="#43-continuous-batching连续批处理" data-toc-link>4.3 Continuous Batching（连续批处理）</a><ul class="toc-list"></ul></li></ul></li><li class="toc-l2"><a href="#5-模型结构层面的-kv-cache-优化" data-toc-link>5. 模型结构层面的 KV Cache 优化</a><ul class="toc-list"><li class="toc-l3"><a href="#51-multi-query-attention-mqa-grouped-query-attention-gqa" data-toc-link>5.1 Multi-Query Attention (MQA) &amp;amp; Grouped-Query Attention (GQA)</a></li><li class="toc-l3"><a href="#52-mqa-为什么比-single-head-好" data-toc-link>5.2 MQA 为什么比 Single Head 好？</a></li></ul></li><li class="toc-l2"><a href="#6-优化全景图" data-toc-link>6. 优化全景图</a></li><li class="toc-l2"><a href="#思考题" data-toc-link>思考题</a></li></ul></li></ul></aside>
+</main>
+<script src="../assets/blog.js?v=1788185626"></script>
+</body>
+</html>

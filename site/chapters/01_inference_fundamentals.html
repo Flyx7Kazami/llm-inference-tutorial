@@ -1,0 +1,387 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>01 · LLM 推理基础 · LLM 推理优化</title>
+<meta name="description" content="自回归生成的本质、Prefill 与 Decode 两个阶段、为什么推理是 memory-bound、关键性能指标。">
+<link rel="stylesheet" href="../assets/blog.css?v=1788185626">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2318181b'/%3E%3Ctext x='16' y='22' font-family='Menlo,monospace' font-size='17' font-weight='600' fill='%23fafafa' text-anchor='middle'%3E%CE%BB%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<header class="site-header">
+  <div class="container header-inner">
+    <a class="brand" href="../index.html">
+      <span class="brand-mark">λ</span>
+      <span class="brand-name">LLM 推理优化</span>
+    </a>
+    <nav class="site-nav"><a href="../chapters/01_inference_fundamentals.html" title="第 01 章">01</a><a href="../chapters/02_kv_cache_and_memory.html" title="第 02 章">02</a><a href="../chapters/03_quantization.html" title="第 03 章">03</a><a href="../chapters/04_parallelism_and_serving.html" title="第 04 章">04</a><a href="../chapters/05_advanced_techniques.html" title="第 05 章">05</a><a href="../chapters/06_framework_ecosystem.html" title="第 06 章">06</a><a href="../chapters/07_cluster_and_infra.html" title="第 07 章">07</a></nav>
+    <details class="mobile-nav">
+      <summary>章节</summary>
+      <div class="mobile-nav-panel"><a href="../chapters/01_inference_fundamentals.html" title="第 01 章">01</a><a href="../chapters/02_kv_cache_and_memory.html" title="第 02 章">02</a><a href="../chapters/03_quantization.html" title="第 03 章">03</a><a href="../chapters/04_parallelism_and_serving.html" title="第 04 章">04</a><a href="../chapters/05_advanced_techniques.html" title="第 05 章">05</a><a href="../chapters/06_framework_ecosystem.html" title="第 06 章">06</a><a href="../chapters/07_cluster_and_infra.html" title="第 07 章">07</a></div>
+    </details>
+  </div>
+</header>
+<main class="container main-grid">
+  <article class="prose">
+<div class="chapter-head"><div class="breadcrumb"><a href="../index.html">首页</a><span class="sep">/</span>第 01 章</div></div><h1 id="第一章llm-推理基础-推理到底慢在哪">第一章：LLM 推理基础 —— 推理到底慢在哪？</h1>
+<h2 id="1-自回归生成llm-推理的本质">1. 自回归生成：LLM 推理的本质</h2>
+<p>LLM 推理是 <strong>自回归（autoregressive）</strong> 过程：每次只生成一个 token，把生成的 token 拼回输入，再生成下一个。</p>
+<div class="codehilite"><pre><span></span><code>输入: "今天天气"
+Step 1: "今天天气" → "真"     # 预测第 1 个新 token
+Step 2: "今天天气真" → "好"   # 预测第 2 个新 token
+Step 3: "今天天气真好" → "！"  # 预测第 3 个新 token
+...
+</code></pre></div>
+
+<p>这就是推理慢的根本原因：<strong>生成 N 个 token 需要 N 次前向传播</strong>。</p>
+<p></p>
+<blockquote class="callout callout-warn">
+<p>⚠️ 算法同学容易混淆的直觉：你可能觉得 Transformer 的并行性很好，训练时确实如此——所有 token 同时算。但推理时每次只产出一个 token，训练时的并行优势荡然无存。</p>
+</blockquote>
+<h2 id="2-两个阶段prefill-vs-decode">2. 两个阶段：Prefill vs Decode</h2>
+<figure class="anim-figure"><figcaption><span class="anim-badge"><svg viewBox="0 0 24 24" fill="currentColor" width="11" height="11"><path d="M8 5.5v13l11-6.5z"/></svg>动画演示</span><span class="anim-title">Prefill vs Decode：两种瓶颈</span><a class="anim-open" href="../animations/prefill-vs-decode/index.html?autoplay=1" target="_blank" rel="noopener">新窗口打开<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="11" height="11"><path d="M7 17L17 7M9 7h8v8"/></svg></a></figcaption><div class="anim-embed"><iframe src="../animations/prefill-vs-decode/index.html?autoplay=1" title="Prefill vs Decode：两种瓶颈" loading="lazy" scrolling="no"></iframe></div><p class="anim-caption">Prefill 一次并行处理整个 prompt（compute-bound）；Decode 逐 token 串行，每步都要把全部权重和 KV Cache 从 HBM 搬进计算单元（memory-bound）。</p></figure>
+<p>这是理解所有推理优化的<strong>基础中的基础</strong>。</p>
+<h3 id="21-prefill-阶段预填充">2.1 Prefill 阶段（预填充）</h3>
+<ul>
+<li><strong>做什么</strong>：处理用户的完整 prompt（如 "今天天气" ），计算所有 token 的表示</li>
+<li><strong>特点</strong>：计算量大（一次处理多个 token），<strong>compute-bound</strong></li>
+<li><strong>类比</strong>：读题——一次性读完所有已知信息</li>
+</ul>
+<h3 id="22-decode-阶段逐-token-生成">2.2 Decode 阶段（逐 token 生成）</h3>
+<ul>
+<li><strong>做什么</strong>：每次只生成一个新 token</li>
+<li><strong>特点</strong>：计算量小（一个 token），但要读取整个模型的权重和 KV cache，<strong>memory-bound</strong></li>
+<li><strong>类比</strong>：答题——每次只写一个字，但每次都要翻看之前读过的内容</li>
+</ul>
+<div class="dg">
+  <div class="dg-flow">
+    <div class="dg-node">
+      <div class="t">Prefill <span class="pill pill-blue">compute-bound</span></div>
+      <div class="l">prompt 的全部 token <b>一次并行算完</b></div>
+      <div class="dg-cells" style="margin-top:10px">
+        <i class="c-blue">今</i><i class="c-blue">天</i><i class="c-blue">天</i><i class="c-blue">气</i><i class="c-blue">…</i><i class="c-dark">真</i>
+      </div>
+      <div class="dg-note-line">整段输入 → 一次前向 → 第 1 个新 token</div>
+    </div>
+    <div class="dg-arrow">→</div>
+    <div class="dg-node">
+      <div class="t">Decode <span class="pill pill-amber">memory-bound</span></div>
+      <div class="l">每次只算 <b>1 个</b>新 token，重复 N 次</div>
+      <div class="dg-cells" style="margin-top:10px">
+        <i class="c-green">真</i>→<i class="c-green">好</i>→<i class="c-green">!</i>→<i class="c-green">…</i>
+      </div>
+      <div class="dg-note-line">每步都要重读全部权重 + KV Cache</div>
+    </div>
+  </div>
+</div>
+
+<p></p>
+<h3 id="23-关键差异对比">2.3 关键差异对比</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>维度</th>
+<th>Prefill</th>
+<th>Decode</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>每步处理 token 数</td>
+<td>整个 prompt（可数百~数千）</td>
+<td>1 个</td>
+</tr>
+<tr>
+<td>瓶颈</td>
+<td>算力（compute-bound）</td>
+<td>显存带宽（memory-bound）</td>
+</tr>
+<tr>
+<td>GPU 利用率</td>
+<td>高（大量矩阵乘法可并行）</td>
+<td>极低（小矩阵乘法，大部分时间在等内存读取）</td>
+</tr>
+<tr>
+<td>优化方向</td>
+<td>算子融合、FlashAttention</td>
+<td>减少 memory 访问、增大 batch</td>
+</tr>
+</tbody>
+</table></div>
+<blockquote class="callout callout-tip">
+<p>💡 <strong>核心洞察</strong>：Decode 阶段，GPU 绝大部分时间在等数据从显存搬到计算单元，而不是在算。想象一个厨师（GPU）切一个土豆，大部分时间在等食材送来（memory bandwidth），而不是在切（compute）。</p>
+</blockquote>
+<h2 id="3-为什么推理是-memory-bound">3. 为什么推理是 Memory-Bound？</h2>
+<h3 id="31-算术强度arithmetic-intensity">3.1 算术强度（Arithmetic Intensity）</h3>
+<figure class="anim-figure"><figcaption><span class="anim-badge"><svg viewBox="0 0 24 24" fill="currentColor" width="11" height="11"><path d="M8 5.5v13l11-6.5z"/></svg>动画演示</span><span class="anim-title">Roofline 模型：算术强度决定瓶颈</span><a class="anim-open" href="../animations/arithmetic-intensity/index.html?autoplay=1" target="_blank" rel="noopener">新窗口打开<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="11" height="11"><path d="M7 17L17 7M9 7h8v8"/></svg></a></figcaption><div class="anim-embed"><iframe src="../animations/arithmetic-intensity/index.html?autoplay=1" title="Roofline 模型：算术强度决定瓶颈" loading="lazy" scrolling="no"></iframe></div><p class="anim-caption">算术强度 = FLOPs ÷ 访存字节数。Decode 只有 ≈1 FLOP/byte，卡在带宽墙上；增大 batch 把工作点右移，逼近算力上限。</p></figure>
+<p></p>
+<p><strong>算术强度 = FLOPs / 内存访问字节数</strong></p>
+<p>它衡量的是"每从显存读 1 字节数据，能做多少次浮点运算"。这个值越大，说明计算越密集；越小，说明大部分时间在等数据搬运。</p>
+<p>GPU 有两个性能上限：</p>
+<ul>
+<li><strong>峰值算力</strong>：312 TFLOPS（A100 FP16）——每秒最多做 312 万亿次浮点运算</li>
+<li><strong>峰值带宽</strong>：2 TB/s（A100 HBM）——每秒最多从显存读 2TB 数据</li>
+</ul>
+<p><strong>平衡点 = 算力 / 带宽 = 312 / 2 = 156 FLOP/byte</strong></p>
+<ul>
+<li>算术强度 &gt; 156 → 算力先到瓶颈 → <strong>compute-bound</strong></li>
+<li>算术强度 &lt; 156 → 带宽先到瓶颈 → <strong>memory-bound</strong></li>
+</ul>
+<h4 id="补充显存带宽到底指什么gpu-的内存层次结构">补充："显存带宽"到底指什么？GPU 的内存层次结构</h4>
+<p>一个常见误解："权重已经在显存（HBM）里了，为什么还要读？"这涉及 GPU 的存储层次：</p>
+<div class="dg">
+  <div class="dg-flow" style="flex-wrap:nowrap">
+    <div class="dg-node">
+      <div class="t">寄存器</div>
+      <div class="l"><span class="mono">~1 cycle</span> · 每 SM 256KB</div>
+      <div style="margin-top:8px"><span class="pill pill-green">Tensor Core 直接读</span></div>
+    </div>
+    <div class="dg-arrow">→</div>
+    <div class="dg-node">
+      <div class="t">L1 / 共享内存</div>
+      <div class="l"><span class="mono">~5 cycles</span> · 每 SM ~100KB</div>
+      <div style="margin-top:8px"><span class="pill pill-green">tiling 的工作台</span></div>
+    </div>
+    <div class="dg-arrow">→</div>
+    <div class="dg-node">
+      <div class="t">L2 缓存</div>
+      <div class="l"><span class="mono">~50 cycles</span> · 40~80MB</div>
+    </div>
+    <div class="dg-arrow">→</div>
+    <div class="dg-node" style="border-color:#fecaca;background:#fffbfb">
+      <div class="t">显存 HBM</div>
+      <div class="l"><span class="mono">~500 cycles</span> · 80GB (A100)</div>
+      <div style="margin-top:8px"><span class="pill pill-red">权重在这，但算不了</span></div>
+    </div>
+  </div>
+  <div class="dg-cap">越往下越慢、越大。Tensor Core 不能直接访问 HBM——矩阵乘必须分块（tiling）逐块搬运上来算</div>
+</div>
+
+<p>关键事实：<strong>Tensor Core 不能直接对 HBM 里的数据做计算</strong>。矩阵乘法是分块（tiling）执行的——每次算一个小块（如 128×128），必须先把对应的权重块从 HBM 搬到 SM 的共享内存（SRAM），再搬到寄存器，Tensor Core 才能开始算。算完扔掉，再搬下一块。</p>
+<p>所以"显存带宽"（A100 的 2039 GB/s）指的是 <strong>HBM → L2 → SRAM</strong> 这条路径的搬运速度，不是系统内存（DDR）→ 显存的速度（那是 PCIe，仅 ~32 GB/s）。权重推理时已经在 HBM 里，但每次矩阵乘都要从 HBM 搬到计算单元旁，搬运时间就是瓶颈。</p>
+<p>打个比方：HBM 是仓库（放了 140GB 权重），SRAM 是工作台（~100KB），Tensor Core 是工人。工人加工一块材料很快，但材料得从仓库运过来——仓库到工作台的走廊（HBM带宽）只有 2 TB/s，工人大部分时间在等货。量化就是把材料压缩打包，同样的带宽每次能搬 2~4 倍的有效权重。</p>
+<p><strong>为什么不能把权重放到 SRAM 里"不读"？</strong> SRAM 太小了——A100 有 108 个 SM，所有 SRAM 加起来不到 20MB，而 7B 模型 FP16 就有 14GB。根本塞不下，只能"用一块搬一块"。</p>
+<h3 id="32-decode-阶段的算术强度一层完整计算">3.2 Decode 阶段的算术强度：一层完整计算</h3>
+<p>以 LLaMA-2-7B（d=4096, d_intermediate=11008≈8d/3, 32 层）为例，batch=1 时一层做的事：</p>
+<div class="codehilite"><pre><span></span><code>1. QKV 投影:    [1, d] @ [d, 3d]   → FLOPs: 6d²,   读: 6d² 参数
+2. O 投影:      [1, d] @ [d, d]     → FLOPs: 2d²,   读: 2d² 参数
+3. Attention:   Q @ K^T + attn @ V  → FLOPs: 4nd,    读: 4nd KV cache
+4. Gate 投影:   [1, d] @ [d, 8d/3]  → FLOPs: 16d²/3, 读: 16d²/3 参数
+5. Up 投影:     [1, d] @ [d, 8d/3]  → FLOPs: 16d²/3, 读: 16d²/3 参数
+6. Down 投影:   [1, 8d/3] @ [8d/3, d] → FLOPs: 16d²/3, 读: 16d²/3 参数
+</code></pre></div>
+
+<p><strong>线性投影部分（1-2, 4-6）</strong>：</p>
+<div class="codehilite"><pre><span></span><code>FLOPs = 6d² + 2d² + 16d² = 24d²
+FP16 下内存读取 = 24d² × 2 字节 = 48d² 字节
+
+算术强度 = 24d² / 48d² = 0.5 FLOP/byte
+</code></pre></div>
+
+<p><strong>Attention 部分（3）</strong>：</p>
+<div class="codehilite"><pre><span></span><code>FLOPs = 4nd（n 是当前序列长度）
+FP16 下内存读取 = 4nd × 2 字节 = 8nd 字节... 不对，KV Cache 每个 FP16 占 2 字节
+
+K: n × d 个 FP16 = 2nd 字节
+V: n × d 个 FP16 = 2nd 字节
+加上 Q 和输出: ≈ 4nd 字节
+
+算术强度 = 4nd / 4nd = 1 FLOP/byte
+</code></pre></div>
+
+<p><strong>关键发现：所有部分的算术强度都在 0.5~1 FLOP/byte，远低于平衡点 156。</strong></p>
+<p>这不是巧合。对于 batch=1 的矩阵-向量乘法 <code>y = x @ W</code>：</p>
+<div class="codehilite"><pre><span></span><code>FLOPs = 2 × (W 的参数量)
+FP16 内存读取 = 2 × (W 的参数量) 字节
+
+→ 算术强度 = 2 / 2 = 1 FLOP/byte（恒等于 1）
+
+无论 W 多大、是什么形状，只要 batch=1，算术强度恒等于 ~1。
+</code></pre></div>
+
+<h3 id="33-用数字感受差距">3.3 用数字感受差距</h3>
+<p>以 LLaMA-2-70B 为例（FP16，约 140GB 参数）：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>每步 FLOPs</th>
+<th>每步内存读取</th>
+<th>算术强度</th>
+<th>GPU 利用率</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Prefill (prompt=512)</td>
+<td>~19T</td>
+<td>~140GB</td>
+<td>~136</td>
+<td>中等</td>
+</tr>
+<tr>
+<td>Decode (batch=1)</td>
+<td>~0.14T</td>
+<td>~140GB</td>
+<td>~1</td>
+<td><strong>~0.64%</strong></td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>Decode 时每个 token 都要读一遍 140GB 的权重，但只做 0.14T 的计算。</strong> 这就是 memory-bound。</p>
+<p>GPU 利用率的估算：</p>
+<div class="codehilite"><pre><span></span><code>利用率 ≈ 算术强度 / 平衡点 = 1 / 156 ≈ 0.64%
+
+→ 99% 的算力在空转等数据！
+</code></pre></div>
+
+<p>实际中会略高一点（1-3%，因为流水线重叠和 cache 命中），但量级是对的。</p>
+<h3 id="34-增大-batch-为什么能改变局面">3.4 增大 batch 为什么能改变局面？</h3>
+<p>batch=1 时是矩阵-向量乘法 <code>[1, d] @ [d, d]</code>，算术强度 = 1。
+batch=b 时变成矩阵-矩阵乘法 <code>[b, d] @ [d, d]</code>：</p>
+<div class="codehilite"><pre><span></span><code>FLOPs = 2bd²
+内存读取 = 2d² 字节（权重只读一次，多个请求共享！）
+
+算术强度 = 2bd² / 2d² = b FLOP/byte
+
+→ 算术强度随 batch 线性增长！
+  batch=1:   算术强度 = 1    → 严重 memory-bound
+  batch=32:  算术强度 = 32   → 仍然 memory-bound，但好很多
+  batch=156: 算术强度 = 156  → 达到平衡点
+  batch=256: 算术强度 = 256  → compute-bound
+</code></pre></div>
+
+<div class="widget" id="roofline-explorer">
+  <div class="widget-head"><span class="widget-badge">交互</span><span class="widget-title">Roofline 探索器：batch 把工作点推过平衡点</span></div>
+  <div style="font-size:12.5px;color:var(--muted-foreground)">假设 7B FP16 在 A100（312 TFLOPS · 2 TB/s）上 decode，算术强度 ≈ batch</div>
+  <div class="w-ctl" style="margin-top:14px"><label>Batch size <output data-o="batch">8</output></label><input type="range" min="0" max="8" step="0.05" value="3" data-p="batch" data-log="1"></div>
+  <div style="margin-top:14px" data-roofline-chart></div>
+  <div class="w-out">
+    <div class="w-stat"><div class="v" data-o="ai" style="color:#2563eb">—</div><div class="k">算术强度（FLOP/byte）</div></div>
+    <div class="w-stat"><div class="v" data-o="tflops" style="color:#7c3aed">—</div><div class="k">可达算力（上限 312）</div></div>
+    <div class="w-stat"><div class="v" data-o="bound">—</div><div class="k">瓶颈</div></div>
+  </div>
+  <div class="w-stat" style="margin-top:12px">
+    <div class="k">GPU 利用率 <span data-o="util" style="font-family:var(--font-mono);color:var(--foreground)">—</span></div>
+    <div class="w-bar"><i data-o="utilbar" style="width:0%"></i></div>
+  </div>
+</div>
+
+<h3 id="35-如何缓解">3.5 如何缓解？</h3>
+<p>核心思路：<strong>让每次内存读取伴随更多计算</strong></p>
+<ol>
+<li><strong>增大 batch size</strong>：多个请求共享权重读取 → 算术强度随 batch 线性提升</li>
+<li><strong>量化</strong>：权重从 FP16 变成 INT8/INT4 → 内存读取量减半/减四分之三</li>
+<li><strong>Speculative Decoding</strong>：一次猜多个 token → 增加计算量</li>
+</ol>
+<h2 id="4-推理性能的关键指标">4. 推理性能的关键指标</h2>
+<h3 id="41-延迟latency">4.1 延迟（Latency）</h3>
+<ul>
+<li><strong>TTFT（Time To First Token）</strong>：从用户发请求到第一个 token 产出的时间</li>
+<li>主要由 Prefill 阶段决定</li>
+<li><strong>TPOT（Time Per Output Token）</strong>：每生成一个 token 需要的时间</li>
+<li>主要由 Decode 阶段决定</li>
+<li><strong>End-to-end Latency</strong> = TTFT + TPOT × 输出 token 数</li>
+</ul>
+<h3 id="42-ttft-和-prompt-长度的关系">4.2 TTFT 和 prompt 长度的关系</h3>
+<p><strong>一个常见的疑问：Prefill 时所有 token 是并行计算的，为什么 TTFT 还会随 prompt 长度增长？</strong></p>
+<p>"并行"消除了 token 之间的串行等待，但<strong>没有消除计算量本身</strong>。n 个 token 并行过一层，FLOPs 是单 token 的 n 倍，时间也大致是 n 倍。</p>
+<div class="codehilite"><pre><span></span><code>GPU 峰值算力固定为 312 TFLOPS（不是无限的！）
+
+1 token 过一层:   134M FLOPs / 312T ≈ 0.43μs
+512 tokens 过一层: 68.7G FLOPs / 312T ≈ 220μs
+
+两者都跑在峰值算力，但后者 FLOPs 是前者的 512 倍 → 时间也是 512 倍。
+</code></pre></div>
+
+<p>类比：一辆车最高时速 120km/h，跑 1km 需要 30 秒，跑 512km 需要 4 小时多。不是因为车速慢，而是距离本身更远了。</p>
+<p>另外，注意 FLOPs 和 prompt 长度不完全是线性关系——attention 部分是 O(n² × d)，而线性投影是 O(n × d²)。哪个占主导取决于 n 和 d 的关系：</p>
+<div class="codehilite"><pre><span></span><code>n=512,  d=4096:  线性项 ≈ 8.6G, 二次项 ≈ 1.1G → 线性项 8 倍于二次项，近似线性
+n=8192, d=4096:  线性项 ≈ 137G, 二次项 ≈ 275G → 二次项反超，趋向二次
+
+→ 短序列时 TTFT 近似随 prompt 线性增长，长序列时趋向二次增长。
+</code></pre></div>
+
+<h3 id="43-吞吐throughput">4.3 吞吐（Throughput）</h3>
+<ul>
+<li><strong>Tokens/s</strong>：每秒生成的总 token 数（所有请求合计）</li>
+<li><strong>Requests/s</strong>：每秒完成的请求数</li>
+</ul>
+<h3 id="44-它们之间的-trade-off">4.4 它们之间的 Trade-off</h3>
+<div class="codehilite"><pre><span></span><code>吞吐 ↑ ────────┐
+               │  此消彼长
+延迟 ↓ ────────┘
+
+增大 batch → 吞吐 ↑，但单请求延迟也 ↑
+减小 batch → 延迟 ↓，但吞吐也 ↓
+</code></pre></div>
+
+<p>增大 batch 导致延迟上升的原因：</p>
+<ol>
+<li><strong>Attention 计算量随 batch 线性增长</strong>——每个请求都要对自己的 KV Cache 做 attention</li>
+<li><strong>KV Cache 显存占用增加</strong>→ 可能导致显存压力 → 额外延迟</li>
+</ol>
+<p><strong>没有免费的午餐</strong>：推理优化的本质就是在延迟和吞吐之间找到合适的平衡点。</p>
+<h3 id="45-batching-策略与-ttft">4.5 Batching 策略与 TTFT</h3>
+<p>不同的 batching 策略对 TTFT 的影响差异很大：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>策略</th>
+<th>RPM 低时 TTFT</th>
+<th>RPM 高时吞吐</th>
+<th>适用场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Static Batching</td>
+<td>暴涨（等凑 batch）</td>
+<td>好</td>
+<td>不推荐</td>
+</tr>
+<tr>
+<td>Continuous Batching</td>
+<td>稳定（不等）</td>
+<td>好</td>
+<td>在线服务（主流）</td>
+</tr>
+<tr>
+<td>Dynamic + Timeout</td>
+<td>微增（&lt; timeout）</td>
+<td>好</td>
+<td>折中方案</td>
+</tr>
+</tbody>
+</table></div>
+<ul>
+<li><strong>Static Batching</strong>：凑齐 batch_size 个请求才开始处理，低流量时等待时间暴涨</li>
+<li><strong>Continuous Batching</strong>：每个 iteration 有谁就处理谁，不等，TTFT 不受 RPM 影响</li>
+<li><strong>Dynamic + Timeout</strong>：设一个 batching window（如 50ms），窗口内到达的请求组 batch，窗口到了就处理</li>
+</ul>
+<p></p>
+<p>现代推理服务（vLLM / SGLang）普遍采用 Continuous Batching。</p>
+<h2 id="5-一个完整的推理时间分解">5. 一个完整的推理时间分解</h2>
+<p>生成 100 个 token，prompt 长度 500：</p>
+<div class="codehilite"><pre><span></span><code>总时间 = Prefill时间 + Decode时间
+       =    ~50ms    + 100 × ~20ms
+       =    ~50ms    + ~2000ms
+       =           ~2050ms
+
+→ 97% 的时间花在 Decode 阶段
+→ 优化 Decode 是重中之重
+</code></pre></div>
+
+<h2 id="思考题">思考题</h2>
+<ol class="quiz-list"><li>如果 prompt 很长（10k tokens），TTFT 会怎样？瓶颈在哪？<details class="answer"><summary>参考答案</summary><p>TTFT 会随 prompt 长度上升。虽然 prefill 时 token 是并行计算的，但“并行”不等于“不花时间”——n 个 token 的 FLOPs 是单 token 的 n 倍（近似线性，长序列时趋向二次），GPU 算力固定，时间自然随 FLOPs 增长。瓶颈在算力（compute-bound）。</p></details></li><li>为什么增大 batch size 能提升吞吐但也会增大延迟？<details class="answer"><summary>参考答案</summary><p>吞吐提升是因为 batch 增大 → 多个请求共享权重读取 → 算术强度从 1 提升到 b → GPU 利用率提高。延迟上升是因为：① Attention 计算量随 batch 线性增长（每个请求各做各的 attention）；② KV Cache 显存占用增加可能带来额外开销。</p></details></li><li>一个 7B 模型（FP16）在 A100（80GB）上，decode 阶段 batch=1 时的 GPU 利用率大概是多少？<details class="answer"><summary>参考答案</summary><p>Decode batch=1 时算术强度 ≈ 1 FLOP/byte（FP16），A100 平衡点为 156 FLOP/byte，利用率 ≈ 1/156 ≈ 0.64%。实际中因流水线重叠等因素约 1-3%，但量级就是 1% 左右——99% 的算力在空转等数据。</p></details></li></ol>
+
+
+<hr>
+<p><em>下一章：<a href="02_kv_cache_and_memory.html">02_kv_cache_and_memory.md</a> —— 我们来深入看看「每步都要读 140GB」这件事，以及如何用 KV Cache 大幅减少重复计算。</em></p><nav class="pager"><a class="pager-card pager-next" href="02_kv_cache_and_memory.html"><span class="pager-dir">下一章 →</span><span class="pager-title">02 · KV Cache 与内存优化</span></a></nav>
+  </article>
+  <aside class="toc"><div class="toc-title">本页目录</div><ul class="toc-list"><li class="toc-l1"><a href="#第一章llm-推理基础-推理到底慢在哪" data-toc-link>第一章：LLM 推理基础 —— 推理到底慢在哪？</a><ul class="toc-list"><li class="toc-l2"><a href="#1-自回归生成llm-推理的本质" data-toc-link>1. 自回归生成：LLM 推理的本质</a></li><li class="toc-l2"><a href="#2-两个阶段prefill-vs-decode" data-toc-link>2. 两个阶段：Prefill vs Decode</a><ul class="toc-list"><li class="toc-l3"><a href="#21-prefill-阶段预填充" data-toc-link>2.1 Prefill 阶段（预填充）</a></li><li class="toc-l3"><a href="#22-decode-阶段逐-token-生成" data-toc-link>2.2 Decode 阶段（逐 token 生成）</a></li><li class="toc-l3"><a href="#23-关键差异对比" data-toc-link>2.3 关键差异对比</a></li></ul></li><li class="toc-l2"><a href="#3-为什么推理是-memory-bound" data-toc-link>3. 为什么推理是 Memory-Bound？</a><ul class="toc-list"><li class="toc-l3"><a href="#31-算术强度arithmetic-intensity" data-toc-link>3.1 算术强度（Arithmetic Intensity）</a><ul class="toc-list"></ul></li><li class="toc-l3"><a href="#32-decode-阶段的算术强度一层完整计算" data-toc-link>3.2 Decode 阶段的算术强度：一层完整计算</a></li><li class="toc-l3"><a href="#33-用数字感受差距" data-toc-link>3.3 用数字感受差距</a></li><li class="toc-l3"><a href="#34-增大-batch-为什么能改变局面" data-toc-link>3.4 增大 batch 为什么能改变局面？</a></li><li class="toc-l3"><a href="#35-如何缓解" data-toc-link>3.5 如何缓解？</a></li></ul></li><li class="toc-l2"><a href="#4-推理性能的关键指标" data-toc-link>4. 推理性能的关键指标</a><ul class="toc-list"><li class="toc-l3"><a href="#41-延迟latency" data-toc-link>4.1 延迟（Latency）</a></li><li class="toc-l3"><a href="#42-ttft-和-prompt-长度的关系" data-toc-link>4.2 TTFT 和 prompt 长度的关系</a></li><li class="toc-l3"><a href="#43-吞吐throughput" data-toc-link>4.3 吞吐（Throughput）</a></li><li class="toc-l3"><a href="#44-它们之间的-trade-off" data-toc-link>4.4 它们之间的 Trade-off</a></li><li class="toc-l3"><a href="#45-batching-策略与-ttft" data-toc-link>4.5 Batching 策略与 TTFT</a></li></ul></li><li class="toc-l2"><a href="#5-一个完整的推理时间分解" data-toc-link>5. 一个完整的推理时间分解</a></li><li class="toc-l2"><a href="#思考题" data-toc-link>思考题</a></li></ul></li></ul></aside>
+</main>
+<script src="../assets/blog.js?v=1788185626"></script>
+</body>
+</html>

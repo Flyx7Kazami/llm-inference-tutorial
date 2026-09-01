@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Prefill-Decode 分离架构</title>
+<meta name="hyperframes:composition" content="pd-disaggregation">
+<meta name="hyperframes:width" content="1280">
+<meta name="hyperframes:height" content="720">
+<meta name="hyperframes:duration" content="14">
+<meta name="hyperframes:fps" content="30">
+<link rel="stylesheet" href="anim.css">
+<style>
+  .pool { position: absolute; top: 150px; width: 400px; height: 320px; background: var(--panel); border: 1.5px solid var(--line); border-radius: 14px; }
+  #pool-p { left: 40px; }
+  #pool-d { left: 840px; }
+  .pool-badge { position: absolute; top: 14px; right: 14px; }
+  .inst { position: absolute; left: 20px; width: 360px; background: #fff; border: 1.5px solid var(--line); border-radius: 10px; }
+  .inst-name { position: absolute; top: 8px; left: 12px; font-family: var(--mono); font-size: 12px; font-weight: 600; color: var(--ink2); }
+  .req-chip { position: absolute; width: 76px; height: 30px; border-radius: 999px; background: #fff; border: 1.5px solid var(--line); font-size: 12.5px; font-weight: 600; display: flex; align-items: center; justify-content: center; z-index: 6; }
+  #kv-pkt { position: absolute; left: 452px; top: 284px; width: 96px; height: 30px; border-radius: 8px; background: var(--violet); color: #fff; font-family: var(--mono); font-size: 11.5px; font-weight: 600; display: flex; align-items: center; justify-content: center; opacity: 0; z-index: 6; box-shadow: 0 4px 14px rgba(124,58,237,.35); }
+  .bd-dot { position: absolute; width: 13px; height: 13px; border-radius: 4px; background: var(--amber-bg); border: 1.5px solid #fcd34d; opacity: 0; }
+  #ratio { position: absolute; left: 40px; top: 512px; width: 1200px; height: 110px; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; }
+  .ratio-seg { position: absolute; font-family: var(--mono); font-size: 17px; color: var(--ink); opacity: 0; white-space: nowrap; }
+  .ratio-hl { color: var(--blue); font-weight: 650; }
+</style>
+</head>
+<body>
+<div id="root" data-composition-id="pd-disaggregation" data-start="0" data-duration="14" data-width="1280" data-height="720">
+  <header class="hf-head">
+    <div class="hf-head-text">
+      <span class="hf-kicker">Chapter 04 · 并行与服务架构</span>
+      <h1 class="hf-title">Prefill-Decode 分离：两种瓶颈，两套资源池</h1>
+    </div>
+    <span class="hf-chapter">09 / 12</span>
+  </header>
+
+  <div id="scene">
+    <div class="req-chip" id="req-a" style="left:60px;top:112px;">请求 A</div>
+    <div class="req-chip" id="req-b" style="left:150px;top:112px;opacity:0;">请求 B</div>
+
+    <div class="pool" id="pool-p">
+      <span class="stage-label" style="top:14px;left:16px;">Prefill 池</span>
+      <span class="pool-badge badge badge-blue">compute-bound · 算力卡</span>
+      <div class="inst" id="pi-0" style="top:60px;height:96px;">
+        <span class="inst-name">prefill-0 · H100</span>
+        <span class="label" style="position:absolute;top:36px;left:12px;">算力利用</span>
+        <div class="bar-track" style="left:12px;top:58px;width:330px;height:12px;"><div class="bar-fill bar-blue" id="pu-0"></div></div>
+      </div>
+      <div class="inst" id="pi-1" style="top:172px;height:96px;">
+        <span class="inst-name">prefill-1 · H100</span>
+        <span class="label" style="position:absolute;top:36px;left:12px;">算力利用</span>
+        <div class="bar-track" style="left:12px;top:58px;width:330px;height:12px;"><div class="bar-fill bar-blue" id="pu-1"></div></div>
+      </div>
+    </div>
+
+    <div class="pool" id="pool-d">
+      <span class="stage-label" style="top:14px;left:16px;">Decode 池</span>
+      <span class="pool-badge badge badge-amber">memory-bound · 带宽卡 · 大 batch</span>
+      <div class="inst" id="di-0" style="top:60px;height:76px;">
+        <span class="inst-name">decode-0 · 大 batch</span>
+        <span class="label" style="position:absolute;top:12px;right:12px;color:var(--green);">TPOT 稳定</span>
+      </div>
+      <div class="inst" id="di-1" style="top:150px;height:76px;">
+        <span class="inst-name">decode-1 · 大 batch</span>
+      </div>
+      <div class="inst" id="di-2" style="top:240px;height:76px;">
+        <span class="inst-name">decode-2 · 大 batch</span>
+      </div>
+    </div>
+
+    <svg width="1280" height="720" style="position:absolute;left:0;top:0;pointer-events:none;">
+      <line x1="452" y1="300" x2="828" y2="300" stroke="#c4b5fd" stroke-width="2.5" stroke-dasharray="7 6"/>
+    </svg>
+    <span class="label" style="position:absolute;left:560px;top:264px;color:var(--violet);">KV Cache 传输 · RDMA / NVLink</span>
+    <div id="kv-pkt">KV Cache</div>
+
+    <div id="ratio">
+      <span class="label" style="position:absolute;top:12px;left:16px;">稳态资源配比：Prefill 吞吐 = Decode 吞吐</span>
+      <span class="ratio-seg" id="rs-1" style="left:60px;top:48px;">N_p / N_d&nbsp; = &nbsp;T_prefill / T_decode</span>
+      <span class="ratio-seg" id="rs-2" style="left:480px;top:48px;">=&nbsp; 80ms / 5000ms</span>
+      <span class="ratio-seg ratio-hl" id="rs-3" style="left:790px;top:48px;font-size:20px;">≈&nbsp; 1 : 63</span>
+      <span class="note" id="rs-note" style="left:60px;top:82px;opacity:0;">T_decode = 200 tokens × 25ms TPOT —— Decode 长尾决定：Decode 池要大得多</span>
+    </div>
+  </div>
+
+  <footer class="hf-caption"><span class="cap-dot"></span><span id="cap-text"></span></footer>
+</div>
+<script src="gsap.min.js"></script>
+<script>
+(function () {
+  // decode-0 的 batch 小方块
+  for (var j = 0; j < 8; j++) {
+    var dot = document.createElement("div");
+    dot.className = "bd-dot";
+    dot.id = "bd0-" + j;
+    dot.style.left = 12 + j * 20 + "px";
+    dot.style.top = "44px";
+    document.getElementById("di-0").appendChild(dot);
+  }
+
+  var tl = gsap.timeline({ paused: true, defaults: { ease: "power2.inOut" } });
+  var cap = function (t, text) { tl.set("#cap-text", { textContent: text }, t); };
+
+  cap(0, "混部的痛点：长 prefill 抢占算力，拖慢同 iteration 所有请求的 decode");
+  tl.fromTo("#pool-p, #pool-d", { autoAlpha: 0, y: 16 }, { autoAlpha: 1, y: 0, duration: 0.5, stagger: 0.15 }, 0.3);
+
+  // 请求 A: prefill → KV 传输 → decode
+  cap(1.4, "分离后：请求 A 先进入 Prefill 池 —— 小 batch 也能打满算力，TTFT 可预测");
+  tl.to("#req-a", { x: 130, y: 85, duration: 0.6 }, 1.4);
+  tl.to("#pu-0", { width: "96%", duration: 0.9, ease: "power2.out" }, 2.0);
+  tl.to("#req-a", { autoAlpha: 0, duration: 0.3 }, 2.8);
+  cap(3.4, "Prefill 一完成，KV Cache 立刻经高速互联送往 Decode 池");
+  tl.fromTo("#kv-pkt", { autoAlpha: 0 }, { autoAlpha: 1, duration: 0.25 }, 3.4);
+  tl.to("#kv-pkt", { x: 380, duration: 1.1, ease: "power1.inOut" }, 3.55);
+  tl.to("#kv-pkt", { autoAlpha: 0, duration: 0.2 }, 4.65);
+  tl.to("#pu-0", { width: "8%", duration: 0.5 }, 3.6);
+  cap(5.0, "Decode 池不被 prefill 打断：专心开大 batch，打满显存带宽，TPOT 稳定");
+  tl.fromTo(".bd-dot", { autoAlpha: 0, scale: 0 }, { autoAlpha: 1, scale: 1, duration: 0.3, stagger: 0.12, ease: "back.out(2)" }, 5.0);
+
+  // 请求 B 并行进入另一个 prefill 实例
+  cap(7.0, "请求 B 同时进入另一个 Prefill 实例 —— 两池互不干扰，独立伸缩");
+  tl.to("#req-b", { opacity: 1, duration: 0.2 }, 7.0);
+  tl.to("#req-b", { x: 120, y: 197, duration: 0.6 }, 7.2);
+  tl.to("#pu-1", { width: "96%", duration: 0.9, ease: "power2.out" }, 7.8);
+  tl.to("#req-b", { autoAlpha: 0, duration: 0.3 }, 8.6);
+  tl.fromTo("#kv-pkt", { autoAlpha: 0 }, { autoAlpha: 1, duration: 0.25 }, 9.0);
+  tl.to("#kv-pkt", { x: 380, duration: 1.1, ease: "power1.inOut" }, 9.15);
+  tl.to("#kv-pkt", { autoAlpha: 0, duration: 0.2 }, 10.25);
+  tl.to("#pu-1", { width: "8%", duration: 0.5 }, 9.2);
+
+  // 配比公式
+  cap(10.6, "配比怎么定？稳态要求两池吞吐相等：N_p / N_d = T_prefill / T_decode");
+  tl.to("#rs-1", { opacity: 1, duration: 0.4 }, 10.6);
+  tl.to("#rs-2", { opacity: 1, duration: 0.4 }, 11.4);
+  tl.to("#rs-3", { opacity: 1, scale: 1.15, duration: 0.4, ease: "back.out(2)" }, 12.0);
+  tl.to("#rs-note", { opacity: 1, duration: 0.4 }, 12.4);
+  cap(12.6, "1 个 Prefill 实例 ≈ 63 个 Decode 实例 —— Decode 长尾决定集群形态");
+  tl.to("#scene", { autoAlpha: 0, duration: 0.5 }, 13.4);
+
+  window.__timelines = window.__timelines || {};
+  window.__timelines["pd-disaggregation"] = tl;
+  if (new URLSearchParams(location.search).has("autoplay")) { tl.repeat(-1).play(); }
+})();
+</script>
+</body>
+</html>

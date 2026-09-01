@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>MHA / GQA / MQA：共享 K/V 的取舍</title>
+<meta name="hyperframes:composition" content="mha-gqa-mqa">
+<meta name="hyperframes:width" content="1280">
+<meta name="hyperframes:height" content="720">
+<meta name="hyperframes:duration" content="12">
+<meta name="hyperframes:fps" content="30">
+<link rel="stylesheet" href="anim.css">
+<style>
+  .col { position: absolute; top: 106px; width: 360px; height: 452px; background: var(--panel); border: 1.5px solid var(--line); border-radius: 14px; }
+  #col-mha { left: 40px; }
+  #col-gqa { left: 460px; }
+  #col-mqa { left: 880px; }
+  .col-title { position: absolute; top: 14px; left: 16px; font-size: 16px; font-weight: 650; font-family: var(--mono); }
+  .col-badge { position: absolute; top: 14px; right: 14px; }
+  .q-chip { position: absolute; top: 64px; width: 32px; height: 32px; border-radius: 7px; background: #fff; border: 1.5px solid #93c5fd; color: #1d4ed8; font-family: var(--mono); font-size: 11px; font-weight: 600; display: flex; align-items: center; justify-content: center; opacity: 0; }
+  .kv-chip { position: absolute; top: 194px; width: 44px; height: 42px; border-radius: 8px; border: 1.5px solid #c4b5fd; background: var(--violet-bg); color: #6d28d9; font-family: var(--mono); font-size: 10.5px; font-weight: 600; display: flex; align-items: center; justify-content: center; opacity: 0; }
+  .kv-bar-val { position: absolute; top: 350px; font-family: var(--mono); font-size: 13px; font-weight: 650; opacity: 0; }
+  .col-note { position: absolute; top: 392px; left: 16px; width: 328px; font-size: 12px; color: var(--mut); line-height: 1.5; }
+</style>
+</head>
+<body>
+<div id="root" data-composition-id="mha-gqa-mqa" data-start="0" data-duration="12" data-width="1280" data-height="720">
+  <header class="hf-head">
+    <div class="hf-head-text">
+      <span class="hf-kicker">Chapter 02 · KV Cache 与内存优化</span>
+      <h1 class="hf-title">MHA / GQA / MQA：K/V 组数决定 KV Cache 体积</h1>
+    </div>
+    <span class="hf-chapter">06 / 12</span>
+  </header>
+
+  <div id="scene">
+    <div class="col" id="col-mha">
+      <span class="col-title">MHA</span>
+      <span class="col-badge badge badge-red">基线 · 8 组 K/V</span>
+      <span class="label" style="position:absolute;top:46px;left:16px;">Q · 8 heads</span>
+      <span class="label" style="position:absolute;top:170px;left:16px;">K · V（每 head 一组）</span>
+      <span class="label" style="position:absolute;top:300px;left:16px;">KV Cache 体积</span>
+      <div class="bar-track" style="left:16px;top:322px;width:280px;height:16px;"><div class="bar-fill bar-red" id="bar-mha"></div></div>
+      <span class="kv-bar-val" style="left:16px;color:var(--red);" id="val-mha">100%</span>
+      <p class="col-note">8 个 head 各自独立 K/V，质量基线，缓存最大</p>
+    </div>
+    <div class="col" id="col-gqa">
+      <span class="col-title">GQA</span>
+      <span class="col-badge badge badge-green">主流 · LLaMA-2/3</span>
+      <span class="label" style="position:absolute;top:46px;left:16px;">Q · 8 heads / 2 组</span>
+      <span class="label" style="position:absolute;top:170px;left:16px;">K · V（4 head 共享一组）</span>
+      <span class="label" style="position:absolute;top:300px;left:16px;">KV Cache 体积</span>
+      <div class="bar-track" style="left:16px;top:322px;width:280px;height:16px;"><div class="bar-fill bar-green" id="bar-gqa"></div></div>
+      <span class="kv-bar-val" style="left:16px;color:var(--green);" id="val-gqa">25%</span>
+      <p class="col-note">质量损失 &lt;1%，缓存 ÷4 —— 当前主流选择</p>
+    </div>
+    <div class="col" id="col-mqa">
+      <span class="col-title">MQA</span>
+      <span class="col-badge badge badge-amber">极致 · 1 组 K/V</span>
+      <span class="label" style="position:absolute;top:46px;left:16px;">Q · 8 heads</span>
+      <span class="label" style="position:absolute;top:170px;left:16px;">K · V（全部共享）</span>
+      <span class="label" style="position:absolute;top:300px;left:16px;">KV Cache 体积</span>
+      <div class="bar-track" style="left:16px;top:322px;width:280px;height:16px;"><div class="bar-fill bar-amber" id="bar-mqa"></div></div>
+      <span class="kv-bar-val" style="left:16px;color:var(--amber);" id="val-mqa">12.5%</span>
+      <p class="col-note">缓存 ÷8，损失 1–3%；仍远好于 single-head（Q 保持多头）</p>
+    </div>
+  </div>
+
+  <footer class="hf-caption"><span class="cap-dot"></span><span id="cap-text"></span></footer>
+</div>
+<script src="gsap.min.js"></script>
+<script>
+(function () {
+  // 每列生成 8 个 Q chip + K/V 组 chip + 连线 SVG
+  // Q chip: x = 24 + i*40 (w32), 中心 = 40 + i*40, top 64..96
+  // K/V chip: top 194..236；MHA 中心 40+i*40；GQA 中心 100 / 260；MQA 中心 180
+  var cols = [
+    { id: "mha", kvX: [40, 80, 120, 160, 200, 240, 280, 320], qmap: [0, 1, 2, 3, 4, 5, 6, 7] },
+    { id: "gqa", kvX: [100, 260], qmap: [0, 0, 0, 0, 1, 1, 1, 1] },
+    { id: "mqa", kvX: [180], qmap: [0, 0, 0, 0, 0, 0, 0, 0] }
+  ];
+  cols.forEach(function (col) {
+    var panel = document.getElementById("col-" + col.id);
+    var svgNS = "http://www.w3.org/2000/svg";
+    var svg = document.createElementNS(svgNS, "svg");
+    svg.setAttribute("width", "360");
+    svg.setAttribute("height", "452");
+    svg.style.position = "absolute";
+    svg.style.left = "0"; svg.style.top = "0";
+    svg.style.pointerEvents = "none";
+    panel.appendChild(svg);
+    for (var i = 0; i < 8; i++) {
+      var q = document.createElement("div");
+      q.className = "q-chip";
+      q.id = col.id + "-q" + i;
+      q.textContent = "Q" + i;
+      q.style.left = 24 + i * 40 + "px";
+      panel.appendChild(q);
+      var g = col.qmap[i];
+      var line = document.createElementNS(svgNS, "line");
+      line.setAttribute("x1", 40 + i * 40); line.setAttribute("y1", 96);
+      line.setAttribute("x2", col.kvX[g]); line.setAttribute("y2", 194);
+      line.setAttribute("stroke", "#a1a1aa"); line.setAttribute("stroke-width", "1.5");
+      line.classList.add(col.id + "-link");
+      line.style.opacity = "0";
+      svg.appendChild(line);
+    }
+    col.kvX.forEach(function (cx, g) {
+      var kv = document.createElement("div");
+      kv.className = "kv-chip";
+      kv.id = col.id + "-kv" + g;
+      kv.textContent = "K·V" + (col.kvX.length > 1 ? g : "");
+      kv.style.left = cx - 22 + "px";
+      panel.appendChild(kv);
+    });
+  });
+
+  var tl = gsap.timeline({ paused: true, defaults: { ease: "power2.inOut" } });
+  var cap = function (t, text) { tl.set("#cap-text", { textContent: text }, t); };
+
+  cap(0, "三种注意力变体：Q 始终是 8 个头，区别只在 K/V 的组数");
+  tl.fromTo(".col", { autoAlpha: 0, y: 16 }, { autoAlpha: 1, y: 0, duration: 0.5, stagger: 0.12 }, 0.2);
+
+  function buildCol(prefix, t0, kvStagger) {
+    tl.fromTo("#col-" + prefix + " .q-chip", { autoAlpha: 0, y: -10 }, { autoAlpha: 1, y: 0, duration: 0.3, stagger: 0.05 }, t0);
+    tl.fromTo("#col-" + prefix + " .kv-chip", { autoAlpha: 0, y: 10 }, { autoAlpha: 1, y: 0, duration: 0.3, stagger: kvStagger }, t0 + 0.4);
+    tl.to("." + prefix + "-link", { opacity: 1, duration: 0.35, stagger: 0.04 }, t0 + 0.7);
+  }
+  cap(1.2, "MHA：每个 head 一组 K/V —— 质量基线，但 8 组 K/V 全量进缓存");
+  buildCol("mha", 1.2, 0.05);
+  cap(4.0, "GQA：4 个 head 共享一组 K/V —— 8 组变 2 组，质量损失 <1%");
+  buildCol("gqa", 4.0, 0.15);
+  cap(6.8, "MQA：8 个 head 共享同一组 K/V —— 缓存直接 ÷8");
+  buildCol("mqa", 6.8, 0.1);
+
+  cap(9.0, "KV Cache 体积：100% → 25% → 12.5%（注意力的多样性主要来自 Q）");
+  tl.to("#bar-mha", { width: "100%", duration: 0.6, ease: "power2.out" }, 9.0);
+  tl.to("#bar-gqa", { width: "25%", duration: 0.6, ease: "power2.out" }, 9.3);
+  tl.to("#bar-mqa", { width: "12.5%", duration: 0.6, ease: "power2.out" }, 9.6);
+  tl.to(".kv-bar-val", { opacity: 1, duration: 0.4 }, 9.3);
+  tl.fromTo("#col-gqa", { borderColor: "#e4e4e7" }, { borderColor: "#059669", duration: 0.4 }, 10.4);
+  cap(10.4, "LLaMA-2/3-70B 选择 GQA：质量几乎无损，KV Cache 小 4 倍");
+  tl.to("#scene", { autoAlpha: 0, duration: 0.5 }, 11.5);
+
+  window.__timelines = window.__timelines || {};
+  window.__timelines["mha-gqa-mqa"] = tl;
+  if (new URLSearchParams(location.search).has("autoplay")) { tl.repeat(-1).play(); }
+})();
+</script>
+</body>
+</html>

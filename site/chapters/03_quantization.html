@@ -1,0 +1,572 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>03 · 量化 · LLM 推理优化</title>
+<meta name="description" content="均匀量化的数学、PTQ 主流方法（GPTQ / AWQ / FP8）、Weight-Only 与反量化开销。">
+<link rel="stylesheet" href="../assets/blog.css?v=1788185626">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2318181b'/%3E%3Ctext x='16' y='22' font-family='Menlo,monospace' font-size='17' font-weight='600' fill='%23fafafa' text-anchor='middle'%3E%CE%BB%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<header class="site-header">
+  <div class="container header-inner">
+    <a class="brand" href="../index.html">
+      <span class="brand-mark">λ</span>
+      <span class="brand-name">LLM 推理优化</span>
+    </a>
+    <nav class="site-nav"><a href="../chapters/01_inference_fundamentals.html" title="第 01 章">01</a><a href="../chapters/02_kv_cache_and_memory.html" title="第 02 章">02</a><a href="../chapters/03_quantization.html" title="第 03 章">03</a><a href="../chapters/04_parallelism_and_serving.html" title="第 04 章">04</a><a href="../chapters/05_advanced_techniques.html" title="第 05 章">05</a><a href="../chapters/06_framework_ecosystem.html" title="第 06 章">06</a><a href="../chapters/07_cluster_and_infra.html" title="第 07 章">07</a></nav>
+    <details class="mobile-nav">
+      <summary>章节</summary>
+      <div class="mobile-nav-panel"><a href="../chapters/01_inference_fundamentals.html" title="第 01 章">01</a><a href="../chapters/02_kv_cache_and_memory.html" title="第 02 章">02</a><a href="../chapters/03_quantization.html" title="第 03 章">03</a><a href="../chapters/04_parallelism_and_serving.html" title="第 04 章">04</a><a href="../chapters/05_advanced_techniques.html" title="第 05 章">05</a><a href="../chapters/06_framework_ecosystem.html" title="第 06 章">06</a><a href="../chapters/07_cluster_and_infra.html" title="第 07 章">07</a></div>
+    </details>
+  </div>
+</header>
+<main class="container main-grid">
+  <article class="prose">
+<div class="chapter-head"><div class="breadcrumb"><a href="../index.html">首页</a><span class="sep">/</span>第 03 章</div></div><h1 id="第三章量化-精度换速度到底怎么换">第三章：量化 —— 精度换速度，到底怎么换？</h1>
+<h2 id="1-为什么量化是推理优化的第一选择">1. 为什么量化是推理优化的第一选择？</h2>
+<p>回顾第一章：Decode 阶段是 memory-bound，瓶颈是<strong>从显存读取模型权重</strong>。</p>
+<p>量化直接减少权重的存储大小：</p>
+<div class="codehilite"><pre><span></span><code>FP32: 每个参数 4 字节  → 70B 模型 = 280 GB
+FP16: 每个参数 2 字节  → 70B 模型 = 140 GB
+INT8: 每个参数 1 字节  → 70B 模型 =  70 GB
+INT4: 每个参数 0.5 字节 → 70B 模型 =  35 GB
+</code></pre></div>
+
+<p><strong>效果立竿见影</strong>：</p>
+<ul>
+<li>显存需求减半/减四分之三 → 单卡可跑更大模型 / 更大 batch</li>
+<li>内存带宽需求等比下降 → Decode 速度直接提升（memory-bound 下速度正比于带宽）</li>
+<li>矩阵乘法可以用 INT8/INT4 专用算子 → 计算也更快</li>
+</ul>
+<h2 id="2-量化的基本方法">2. 量化的基本方法</h2>
+<h3 id="21-均匀量化uniform-quantization">2.1 均匀量化（Uniform Quantization）</h3>
+<figure class="anim-figure"><figcaption><span class="anim-badge"><svg viewBox="0 0 24 24" fill="currentColor" width="11" height="11"><path d="M8 5.5v13l11-6.5z"/></svg>动画演示</span><span class="anim-title">均匀量化：FP32 → INT8 的线性映射</span><a class="anim-open" href="../animations/uniform-quantization/index.html?autoplay=1" target="_blank" rel="noopener">新窗口打开<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="11" height="11"><path d="M7 17L17 7M9 7h8v8"/></svg></a></figcaption><div class="anim-embed"><iframe src="../animations/uniform-quantization/index.html?autoplay=1" title="均匀量化：FP32 → INT8 的线性映射" loading="lazy" scrolling="no"></iframe></div><p class="anim-caption">x_q = round(x / s)，scale s 由 absmax 决定；超出范围的值被截断（clipping），四舍五入引入量化误差。</p></figure>
+<p>最常见的形式：将浮点数线性映射到整数范围。</p>
+<p><strong>量化（Float → Int）</strong>：</p>
+<div class="codehilite"><pre><span></span><code>x_quant = round(x / scale + zero_point)
+</code></pre></div>
+
+<p><strong>反量化（Int → Float）</strong>：</p>
+<div class="codehilite"><pre><span></span><code>x_dequant = (x_quant - zero_point) × scale
+</code></pre></div>
+
+<p>其中：</p>
+<ul>
+<li><code>scale</code> = (max - min) / (q_max - q_min)，控制映射比例（INT8 对称时分母为 127，非对称时为 255）</li>
+<li><code>zero_point</code> = round(q_min - min / scale)，即浮点 0 对应的整数值，处理非对称分布</li>
+</ul>
+<div class="codehilite"><pre><span></span><code>对称量化（zero_point = 0，数据关于 0 对称）：
+  FP16: -2.0  -1.0   0.0   1.0   2.0
+  INT8: -127  -64     0    64    127
+  scale = 2.0 / 127 ≈ 0.0157
+  （要求 max ≈ -min，否则会浪费一半量化位宽）
+
+非对称量化（zero_point ≠ 0，数据分布偏移零点）：
+  FP16: -1.0   0.0   1.0   2.0   3.0
+  INT8: -128  -64     0    64   127
+  scale = (3.0 - (-1.0)) / 255 ≈ 0.0157
+  zero_point = round(-128 - (-1.0) / 0.0157) = -64
+  （浮点 0 映射到整数 -64，充分利用 [-128, 127] 整个范围）
+</code></pre></div>
+
+<p><strong>对称 vs 非对称：数学上是特例，工程上是鸿沟</strong></p>
+<p>数学上，对称量化就是非对称量化加了约束 <code>zero_point = 0</code>，是其子集。但在实际推理中，两者的计算开销天差地别，原因出在矩阵乘法上。</p>
+<p>考虑矩阵乘法 <code>Y = W × X</code>，两者都量化后：</p>
+<p>对称量化（zero_point 均为 0）：</p>
+<div class="codehilite"><pre><span></span><code>Y_dequant = (W_q × X_q) × s_w × s_x
+</code></pre></div>
+
+<p>→ 一次 INT8 GEMM + 一次浮点缩放，硬件 Tensor Core 直接支持，零额外开销。</p>
+<p>非对称量化（zero_point ≠ 0）：</p>
+<div class="codehilite"><pre><span></span><code>Y_dequant = (W_q - z_w) × (X_q - z_x) × s_w × s_x
+         = W_q×X_q × s_w·s_x            ← INT8 GEMM，想要的结果
+         - z_w × X_q × s_w·s_x          ← 额外的向量-矩阵乘
+         - W_q × z_x × s_w·s_x          ← 额外的矩阵-向量乘
+         + z_w × z_x × s_w·s_x          ← 常数项
+</code></pre></div>
+
+<p>→ 一项变四项，GEMM 计算量翻数倍，Tensor Core 加速几乎用不上。</p>
+<p>这就是为什么实际选择是：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th></th>
+<th>对称量化</th>
+<th>非对称量化</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>精度</td>
+<td>数据偏移零点时浪费位宽</td>
+<td>充分利用全部量化 level</td>
+</tr>
+<tr>
+<td>计算开销</td>
+<td>零额外开销</td>
+<td>展开成 4 项，开销大</td>
+</tr>
+<tr>
+<td>适用对象</td>
+<td><strong>权重</strong>（分布大致关于 0 对称）</td>
+<td><strong>激活</strong>（如 ReLU 后全为正，严重偏移零点）</td>
+</tr>
+<tr>
+<td>典型方案</td>
+<td>GPTQ/AWQ 等 weight-only 量化</td>
+<td>真正的 Weight+Activation INT8 推理</td>
+</tr>
+</tbody>
+</table></div>
+<blockquote class="callout callout-tip">
+<p>💡 LLM 推理中 weight-only 量化（GPTQ/AWQ/GGUF）几乎都用对称量化，因为权重近似关于 0 对称，精度损失可忽略，且反量化只需一次乘法。非对称量化只在需要同时量化激活（用上 INT8 Tensor Core 直接加速）时才值得付出额外代价。</p>
+</blockquote>
+<h3 id="22-逐通道-vs-逐张量量化">2.2 逐通道 vs 逐张量量化</h3>
+<ul>
+<li><strong>Per-tensor</strong>：整个权重矩阵用同一个 scale/zero_point</li>
+<li>简单，但不同通道的数值范围差异大时精度损失严重</li>
+<li><strong>Per-channel</strong>（也叫 per-row/per-column）：每行/列用不同的 scale</li>
+<li>精度更好，但需要存更多 scale 参数</li>
+<li><strong>Per-group</strong>：每 128 个元素一组，折中方案</li>
+</ul>
+<div class="dg">
+  <div class="dg-flow" style="text-align:center">
+    <div class="dg-node">
+      <div class="t">Per-tensor</div>
+      <div data-grid8="tensor"></div>
+      <div class="l" style="margin-top:10px">整个 W 共享 <b>1</b> 个 scale</div>
+    </div>
+    <div class="dg-node">
+      <div class="t">Per-channel</div>
+      <div data-grid8="channel"></div>
+      <div class="l" style="margin-top:10px">每行（输出通道）一个 → <b>4096</b> 个</div>
+    </div>
+    <div class="dg-node">
+      <div class="t">Per-group</div>
+      <div data-grid8="group"></div>
+      <div class="l" style="margin-top:10px">每 128 元素一组 → <b>131072</b> 个</div>
+    </div>
+  </div>
+  <div class="dg-cap">颜色相同的区域共享一个 scale（示意 8×8 的 W）。粒度越细，scale 越能适配局部数值范围，但存储和反量化开销越大</div>
+</div>
+
+<blockquote class="callout callout-tip">
+<p>💡 实践中，INT8 量化通常用 per-channel，INT4 量化通常用 per-group（如 GPTQ/AWQ）。</p>
+</blockquote>
+<h2 id="3-量化粒度ptq-vs-qat">3. 量化粒度：PTQ vs QAT</h2>
+<h3 id="31-post-training-quantizationptq训练后量化">3.1 Post-Training Quantization（PTQ，训练后量化）</h3>
+<p><strong>不需要重新训练，直接量化已有模型。</strong></p>
+<ul>
+<li>优点：零训练成本，简单快速</li>
+<li>缺点：低比特（INT4 以下）时精度损失明显</li>
+</ul>
+<p>PTQ 是推理部署的<strong>绝对主流</strong>方式，因为你通常拿不到训练数据/算力去重训。</p>
+<h3 id="32-quantization-aware-trainingqat量化感知训练">3.2 Quantization-Aware Training（QAT，量化感知训练）</h3>
+<p><strong>在训练/微调时模拟量化误差，让模型学会适应低精度。</strong></p>
+<ul>
+<li>优点：精度更好，可以量化到更低比特</li>
+<li>缺点：需要训练数据和算力</li>
+</ul>
+<p>实际生产中很少用 QAT，因为 PTQ 已经够好了。</p>
+<h2 id="4-主流-ptq-方法详解">4. 主流 PTQ 方法详解</h2>
+<h3 id="41-llmint8bitsandbytes">4.1 LLM.int8()（bitsandbytes）</h3>
+<p><strong>核心思路</strong>：混合精度分解</p>
+<div class="codehilite"><pre><span></span><code>大部分通道：INT8 量化 → W_int8 @ X_int8 → 反量化 × scale
+少数 outlier 通道：保持 FP16 → W_fp16 @ X_fp16 → FP16 结果
+
+最终结果 = INT8 部分 + FP16 部分
+</code></pre></div>
+
+<p><strong>为什么需要混合精度？</strong></p>
+<p>Dettmers 等人发现：当模型规模超过 6.7B 后，Transformer 的隐藏状态中会涌现出少量 <strong>outlier feature dimensions</strong>（异常通道）——某些特征维度的激活值幅度可以达到其他维度的 100 倍以上。如果强制将包含 outlier 的激活整行量化到 INT8，scale 会被 outlier 拉大（scale = max|x| / 127），导致正常值的量化精度极差（被压缩到几个整数 level 里）。</p>
+<p><strong>Outlier 是怎么判定的？静态还是动态？</strong></p>
+<ul>
+<li><strong>Outlier 是模型的固有属性，不是动态随机出现的。</strong> 论文发现，对于 175B 模型，始终是相同的约 7 个特征维度（占总维度 0.1%）产生 outlier；对于 70B 模型，约占 5%~25% 的维度。这些维度跨输入、跨层都一致。</li>
+<li><strong>判定方法</strong>：在模型转换/量化时，用一小批校准数据（几百条文本）跑一遍前向传播，统计每个特征维度的激活值绝对值最大值。设定一个阈值（论文中默认 6.0 FP16），超过此阈值的维度标记为 outlier。</li>
+<li><strong>推理时</strong>：不需要重新检测，outlier 维度是固定的。实现上直接将输入 X 的这些列抽出、对应的 W 的行抽出，在 FP16 下单独做矩阵乘；其余部分走 INT8 GEMM。最后加和即可。</li>
+</ul>
+<blockquote class="callout callout-warn">
+<p>⚠️ 注意：LLM.int8() 的 outlier 出现在<strong>激活值</strong>（X）里，不是权重（W）里。权重本身分布很均匀，问题出在某几个通道的输入值特别大，带着 scale 飞起来。</p>
+</blockquote>
+<p><strong>使用场景</strong>：推理 + 微调（QLoRA），精度几乎无损，适合需要保持 FP16 级精度的场景。</p>
+<h3 id="42-gptq">4.2 GPTQ</h3>
+<p><strong>核心思路</strong>：逐层、逐输入通道量化权重，用 Hessian 逆矩阵补偿量化误差</p>
+<p>GPTQ 源自论文 "GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers" (Frantar et al., 2022)，基于经典的 Optimal Brain Damage / Optimal Brain Surgeon (OBS) 框架。</p>
+<p><strong>先澄清一个容易误解的点</strong>：这里说的"第1列/第2列"是指<strong>权重矩阵中沿输入特征维度的列</strong>，不是"第1层/第2层"网络。GPTQ 是逐<strong>层</strong>处理的，每一层内部逐<strong>列</strong>（即逐输入通道）量化。</p>
+<p>以一个线性层 <code>Y = XW</code> 为例（X: [batch, d_in], W: [d_in, d_out]，Y: [batch, d_out]）：</p>
+<ul>
+<li>W 的每一行对应一个<strong>输入通道</strong>到所有输出通道的权重（W 的第 i 行 = d_out 个权重）</li>
+<li>W 的每一列对应所有输入通道到一个<strong>输出通道</strong>的权重（W 的第 j 列 = d_in 个权重）</li>
+<li>GPTQ 是逐<strong>输入通道</strong>量化的（每次量化 W 的一行），量化完第 q 个输入通道的权重后，利用 Hessian 补偿尚未量化的输入通道</li>
+</ul>
+<p><strong>具体量化过程</strong>：</p>
+<div class="codehilite"><pre><span></span><code>第 0 步（离线，仅一次）—— 计算 Hessian：
+  1. 拿 128 条校准文本跑一遍前向传播，记录每层的输入 X
+  2. 对该层计算 Hessian H = 2X^T X / n  (维度 [d_in × d_in])
+     H[i][j] 表示输入通道 i 和 j 对输出误差的二阶相关性
+  3. 加阻尼因子 λI 保证可逆，求逆得 H⁻¹
+
+逐层量化（对每一层的 W）：
+  for 输入通道 q = 0, 1, 2, ..., d_in-1:
+    (a) 将 W[q, :]（第 q 行，d_out 个权重）量化为整数 ŵ_q
+    (b) 计算量化误差：ε = W[q, :] - ŵ_q    (d_out 维向量)
+    (c) 用 H⁻¹ 计算对剩余行（q+1 到 d_in-1）的最优补偿：
+        W[q+1:, :] -= ε / H⁻¹[q,q] · H⁻¹[q+1:, q].reshape(-1, 1)
+        (含义：如果第 q 个输入通道的权重量化产生了误差 ε，
+         那么对后面每个输入通道 j，需要调整 W[j,:] 来抵消 ε 的影响，
+         调整量由 H⁻¹[j,q] / H⁻¹[q,q] 决定)
+    (d) 更新 H⁻¹（Cholesky 分解的 block 更新，避免重新求逆）
+
+  最终得到量化权重 Ŵ，以及 per-group 的 scale
+</code></pre></div>
+
+<p><strong>Hessian 是什么？为什么是二阶？</strong></p>
+<ul>
+<li><strong>Hessian 是谁的 Hessian？</strong> 它是该线性层输出的 L2 误差 <code>L = ||XW - XŴ||²</code> 对权重 W 的二阶导数（海森矩阵）。具体 H = 2XᵀX，形状 [d_in × d_in]，和输出维度 d_out 无关（所有输出列共享同一个 H）。</li>
+<li><strong>为什么不用一阶导（梯度）？</strong> 因为我们面对的是<strong>已经训练好的模型</strong>——权重处于局部最优点，梯度 ≈ 0！一阶导在最优点处完全没有信息量，告诉你"该往哪走"但你已经在谷底了。</li>
+<li><strong>二阶导（Hessian）告诉你什么？</strong> Hessian 描述的是<strong>损失函数的曲率</strong>，即"沿每个方向移动权重，误差增长有多快"。更重要的是，<strong>Hessian 的非对角元素告诉你输入通道之间的相关性</strong>：如果 H⁻¹[q,j] 非零，说明第 q 个输入通道的量化误差可以通过调整第 j 个输入通道的权重来补偿。这就是为什么能做误差补偿的根本原因——不同输入通道对输出的影响不是独立的，存在线性相关，可以"拆东墙补西墙"。</li>
+</ul>
+<blockquote class="callout callout-tip">
+<p>💡 <strong>直觉理解</strong>：想象你在调整一组旋钮（每个旋钮是一个输入通道的权重）来让机器精确输出。一阶导告诉你"每个旋钮往哪拧让结果更好"（但在最优点都是"不用拧"）。二阶导告诉你"如果你拧偏了旋钮 A，旋钮 B/C/D 需要各拧多少才能补回来"。GPTQ 的核心就是这个"自动补偿"。</p>
+</blockquote>
+<p><strong>关键特性</strong>：</p>
+<ul>
+<li>3-4 bit 量化后精度损失很小，在当时（2022）是 PTQ 方法里精度最好的</li>
+<li>只需少量校准数据（128 条文本即可，通常用 WikiText 或 C4 数据集的随机子集）</li>
+<li>量化一个 175B 模型约需 3-4 小时（A100 单卡）</li>
+<li>支持 per-group 量化（group size 通常为 128，更细粒度的 scale）</li>
+<li>量化好的模型是"一锤子买卖"——量化完成后推理时和普通 INT4 权重没有区别，不需要 Hessian</li>
+</ul>
+<h3 id="43-awqactivation-aware-weight-quantization">4.3 AWQ（Activation-aware Weight Quantization）</h3>
+<p><strong>核心观察</strong>：不是所有权重通道同等重要——<strong>对应大激活值的权重通道更关键</strong>。</p>
+<p>出自论文 "AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration" (Lin et al., 2023)。核心直觉很简单：输出 Y = XW，某个输入通道 j 的激活值 |X_j| 大，那么 W 的第 j 行的量化误差会被乘以大系数放大，对输出的影响也大；反之，|X_j| 小的通道，权重误差影响微不足道。</p>
+<p><strong>具体过程（逐线性层）：</strong></p>
+<div class="codehilite"><pre><span></span><code>第 0 步——校准数据收集：
+  1. 跑少量校准文本（默认 128 条，论文发现 32 条就够了）过模型
+  2. 记录每一层的输入激活 X（不需要梯度，只是观察值）
+
+第 1 步——计算通道重要性：
+  对每个输入通道 j，计算：
+    importance_j = mean(|X_j|)     ← 平均激活幅度（或用 max percentile）
+  激活值大的通道 j → W 的第 j 行（该输入通道到所有输出的权重）更重要
+
+第 2 步——搜索最优 per-group 缩放因子 s：
+  把 W 按 group（通常 128 个元素一组）分组，每组找一个缩放 s，
+  使得等价缩放后的权重 W' = W · diag(s) 在量化时误差最小。
+
+  直觉：s 会"拉平"不同通道间的权重幅度差异——
+  重要通道的权重大 → 通过缩放让其相对变小 → 量化时分配到更多 bit 精度；
+  缩放因子本身是 FP16/FP32 标量，存起来几乎不占空间。
+
+  搜索方式：在 s 的候选空间（简单网格搜索或闭式解）中最小化
+    ||X·W - dequant(quant(W·diag(s)))·diag(1/s)||²
+
+第 3 步——量化与推理：
+  用找到的 s 缩放 W → 量化为 INT4 → 保存 INT4 权重 + s（+ per-group scale）
+  推理时：dequant(W_int4) → 乘以 1/s → 恢复到原始尺度
+  s 可以被融合进附近算子（如 RMSNorm、下一层的 scale），几乎无额外开销
+</code></pre></div>
+
+<p><strong>需要多少校准样本？为什么这么少就够了？</strong></p>
+<ul>
+<li>论文实验显示 <strong>32 条文本</strong>就足够，通常用 128 条（和 GPTQ 一致）</li>
+<li>原因：LLM 的激活幅度模式（哪些通道大、哪些通道小）是<strong>模型的固有属性</strong>，不是输入的随机性质——和 LLM.int8() 的 outlier 一样，不管输入什么文本，始终是大致相同的那几个通道激活幅度大。这有点像一个人的骨架——不管他穿什么衣服，骨架不变。少量样本足以稳定估计出相对重要性排序。</li>
+</ul>
+<p><strong>AWQ vs GPTQ：本质区别</strong>：</p>
+<ul>
+<li>GPTQ 的补偿是<strong>跨列的</strong>：量化第 q 列时修改第 q+1... 列的权重，本质是"用其他列弥补当前列的误差"。</li>
+<li>AWQ 不修改权重之间的相对关系，而是通过<strong>缩放</strong>让重要通道在量化时占更多精度，简单直接，没有误差传播问题。</li>
+</ul>
+<p><strong>优势</strong>：</p>
+<ul>
+<li>比 GPTQ 更简单（不需要 Hessian 逆，不需要逐列迭代补偿）</li>
+<li>INT4 量化精度通常优于或持平 GPTQ（尤其是小模型和 outlier 严重的模型）</li>
+<li>量化速度快（只需搜索缩放因子，不需要迭代求逆）</li>
+<li>与推理引擎集成更友好（权重未被"补偿"修改过，兼容性好）</li>
+</ul>
+<h3 id="44-fp8-量化">4.4 FP8 量化</h3>
+<p><strong>不是整数量化，而是用 8-bit 浮点数（E4M3 / E5M2）。</strong></p>
+<p>浮点数的表示方式和整数完全不同。先理解 FP32 的结构，FP8 是它的微缩版：</p>
+<p><strong>浮点数 = (-1)^sign × 2^(exponent - bias) × (1 + mantissa / 2^m_bits)</strong></p>
+<div class="dg">
+  <div class="dg-title">FP32 的位段结构（1 + 8 + 23 = 32 bit）</div>
+  <div class="dg-bits-wrap">
+    <div class="dg-bits">
+      <b class="b-sign" style="--w:1">sign<br>0</b>
+      <b class="b-exp" style="--w:8">exponent（8 bit, bias=127）<br>01111100</b>
+      <b class="b-man" style="--w:23">mantissa（23 bit）<br>01000000000000000000000</b>
+    </div>
+  </div>
+  <div class="dg-lanes" style="margin-top:14px;min-width:0">
+    <div class="dg-row"><span class="dg-lab">sign</span><span class="dg-note-line">0 → 正数</span></div>
+    <div class="dg-row"><span class="dg-lab">exponent</span><span class="dg-note-line">01111100 = 124 → 实际指数 = 124 - 127 = <b>-3</b></span></div>
+    <div class="dg-row"><span class="dg-lab">mantissa</span><span class="dg-note-line">010000... = 2²¹/2²³ = <b>0.25</b></span></div>
+    <div class="dg-row"><span class="dg-lab">值</span><span class="dg-note-line">1.0 × 2⁻³ × (1 + 0.25) = <b>0.15625</b></span></div>
+  </div>
+  <div class="dg-cap">符号位定正负；指数位控制数量级（越多范围越大）；尾数位控制精度（越多间隔越细）</div>
+</div>
+
+<p><strong>FP8 的两种格式</strong>（由 OpenAI/Intel/ARM/NVIDIA 联合制定的 OCP 标准）：</p>
+<div class="dg">
+  <div class="dg-title">FP8 两种格式 vs FP32（按位宽等比例）</div>
+  <div class="dg-bits-wrap">
+    <div class="dg-row" style="display:grid;grid-template-columns:76px 1fr;gap:12px;align-items:center;margin-bottom:8px"><span class="dg-lab">FP32</span><span class="dg-bits" style="display:flex"><b class="b-sign" style="--w:1">s</b><b class="b-exp" style="--w:8">8</b><b class="b-man" style="--w:23">23</b></span></div>
+    <div class="dg-row" style="display:grid;grid-template-columns:76px 1fr;gap:12px;align-items:center;margin-bottom:8px"><span class="dg-lab">E4M3</span><span style="width:25%"><span class="dg-bits" style="display:flex"><b class="b-sign" style="--w:1">s</b><b class="b-exp" style="--w:4">4</b><b class="b-man" style="--w:3">3</b></span></span></div>
+    <div class="dg-row" style="display:grid;grid-template-columns:76px 1fr;gap:12px;align-items:center"><span class="dg-lab">E5M2</span><span style="width:25%"><span class="dg-bits" style="display:flex"><b class="b-sign" style="--w:1">s</b><b class="b-exp" style="--w:5">5</b><b class="b-man" style="--w:2">2</b></span></span></div>
+  </div>
+  <div class="dg-flow" style="margin-top:16px">
+    <div class="dg-node">
+      <div class="t">E4M3 <span class="pill pill-blue">精度优先</span></div>
+      <div class="l">范围 [0.016, 480] · 最小正数 2⁻⁹ ≈ 0.002<br>3 bit 尾数 → 相对误差 ~12.5%<br>无 ∞，仅 1 个 NaN —— <b>适合权重/激活</b></div>
+    </div>
+    <div class="dg-node">
+      <div class="t">E5M2 <span class="pill pill-amber">范围优先</span></div>
+      <div class="l">范围 [6e-5, 57344] · 最小正数 2⁻¹⁷<br>2 bit 尾数 → 相对误差 ~25%<br>有 ∞ 和 NaN（IEEE 兼容）—— <b>适合梯度</b></div>
+    </div>
+  </div>
+  <div class="dg-cap">指数位换范围、尾数位换精度：同样 8 bit，E4M3 与 E5M2 是不同的范围/精度取舍</div>
+</div>
+
+<p><strong>E4M3 示例（从二进制到值）</strong>：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>二进制</th>
+<th>sign</th>
+<th>exponent</th>
+<th>mantissa</th>
+<th>实际值</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>0 0111 100</code></td>
+<td>0</td>
+<td>0111=7 (e-bias=0)</td>
+<td>100 → 4/8=0.5</td>
+<td>+1.0 × 2^0 × 1.5 = <strong>1.5</strong></td>
+<td>简单的小数</td>
+</tr>
+<tr>
+<td><code>0 1000 000</code></td>
+<td>0</td>
+<td>1000=8 (e-bias=1)</td>
+<td>000 → 0/8=0.0</td>
+<td>+1.0 × 2^1 × 1.0 = <strong>2.0</strong></td>
+<td>乘以2</td>
+</tr>
+<tr>
+<td><code>1 0110 010</code></td>
+<td>1</td>
+<td>0110=6 (e-bias=-1)</td>
+<td>010 → 2/8=0.25</td>
+<td>-1.0 × 2^-1 × 1.25 = <strong>-0.625</strong></td>
+<td>负数</td>
+</tr>
+<tr>
+<td><code>0 1110 111</code></td>
+<td>0</td>
+<td>1110=14 (e-bias=7)</td>
+<td>111 → 7/8=0.875</td>
+<td>+1.0 × 2^7 × 1.875 = <strong>240</strong></td>
+<td>E4M3 最大值</td>
+</tr>
+<tr>
+<td><code>0 0000 001</code></td>
+<td>0</td>
+<td>0000=0 (非规格化)</td>
+<td>001 → 1/8=0.125</td>
+<td>+1.0 × 2^-6 × 0.125 = <strong>0.002</strong></td>
+<td>最小次正规数</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>为什么前向用 E4M3，反向用 E5M2？</strong></p>
+<ul>
+<li><strong>前向（权重/激活）</strong>：数值范围可预判（权重初始化和训练后范围稳定），但需要精度 → 给尾数多 1 bit，E4M3 精度更高。</li>
+<li><strong>反向（梯度）</strong>：梯度在训练初期可能很大或很小，<strong>数值范围不可预测</strong>，但精度要求稍低 → 给指数多 1 bit，E5M2 范围更大不容易溢出。</li>
+<li><strong>推理时只用 E4M3</strong>（不需要反向传播）。</li>
+</ul>
+<p>FP8 的优势：</p>
+<ul>
+<li>不需要复杂的量化校准——浮点数自带指数，天然按比例映射不同量级，不存在整数量化中"scale 被 outlier 拉大"的问题</li>
+<li>硬件原生支持（H100、L40S、GB200 等 Hopper/Blackwell 架构的 Tensor Core 可以直接做 FP8 GEMM，吞吐是 FP16 的 2 倍）</li>
+<li>精度损失极小——因为浮点数的相对误差是均匀的（不像整数量化的绝对误差均匀，大值处相对误差小但小值处相对误差大），更符合神经网络数值分布</li>
+<li>不需要 zero_point，不需要 GPTQ/AWQ 这类复杂算法——直接做 per-tensor 或 per-channel 的 scale 即可（就像 FP16 乘个常数再截断）</li>
+</ul>
+<blockquote class="callout callout-warn">
+<p>⚠️ <strong>算法同学注意</strong>：FP8 是目前工业界最看好的方向，因为精度好 + 硬件支持好 + 不需要复杂的量化算法。如果你的部署环境有 H100 或更新的 GPU，优先考虑 FP8（E4M3）。</p>
+</blockquote>
+<h2 id="5-量化后的推理加速">5. 量化后的推理加速</h2>
+<h3 id="51-权重量化-反量化开销">5.1 权重量化 → 反量化开销？</h3>
+<p>INT4/INT8 权重存储，但 GPU 的 Tensor Core 主要做 FP16/FP32 运算。所以实际推理时：</p>
+<div class="codehilite"><pre><span></span><code>INT4 权重 → 反量化为 FP16 → FP16 矩阵乘法
+</code></pre></div>
+
+<p>反量化本身有开销，但由于是 memory-bound，节省的带宽读取远大于反量化开销。</p>
+<h3 id="52-weight-only-vs-weightactivation-量化">5.2 Weight-Only vs Weight+Activation 量化</h3>
+<p>"激活值"（activation）指的是每个 Linear 算子的输入隐藏状态 X（即上一层的输出）：</p>
+<div class="codehilite"><pre><span></span><code>input_ids → Embedding → X₀
+              ↓
+Layer 0: X₀ → Attention(Q/K/V/O投影) → FFN(gate/up/down投影) → X₁
+              ↓
+Layer 1: X₁ → ... → X₂   ...   X_{N} → LM Head → logits
+</code></pre></div>
+
+<p>对任意 Linear：<code>Y = X @ W.T + b</code>，X 就是该层的输入激活，Y 是输出激活。</p>
+<ul>
+<li>对第 0 层来说 X = X₀（embedding 输出），对第 k 层来说 X = X_k（上一层 FFN 的输出）</li>
+<li>LLM.int8() 的 outlier 涌现于<strong>深层隐藏状态</strong>（embedding 层本身没有明显 outlier）</li>
+<li>GPTQ/AWQ 校准阶段记录的是<strong>每个 Linear 的输入 X</strong>，覆盖所有层</li>
+</ul>
+<p>两种量化策略的区别：</p>
+<p><strong>Weight-only 量化</strong>：只把权重 W 量化成 INT4/INT8 存储，激活 X 始终是 FP16。</p>
+<div class="codehilite"><pre><span></span><code>推理时：
+  1. 从显存读 INT4 权重 W_int          ← 读盘量减半/减四分之三（省带宽）
+  2. 反量化 W_int → W_fp16            ← 一个乘法，很便宜
+  3. FP16 矩阵乘：Y = X_fp16 @ W_fp16  ← 还是 FP16 算力
+</code></pre></div>
+
+<ul>
+<li><strong>加速来源</strong>：Decode 阶段是 memory-bound，瓶颈是"从显存读权重"，所以读得少就快；计算本身没加速，但等权重的时间少了</li>
+<li>为什么不直接用 INT Tensor Core？因为 X 还是 FP16，没法做整数矩阵乘</li>
+<li>GPTQ、AWQ、GGUF 都是 weight-only</li>
+</ul>
+<p><strong>Weight+Activation 量化（也叫 "full INT8" 或 "dynamic quantization"）</strong>：权重 W 量化，激活 X 也量化。</p>
+<div class="codehilite"><pre><span></span><code>推理时：
+  1. 从显存读 INT8 权重 W_int8           ← 省带宽
+  2. 对当前输入 X 做动态量化：X_int8 = round(X / s_x)  ← 需要实时计算 scale
+  3. INT8 Tensor Core 做 Y_int = X_int @ W_int    ← 真正的整数 GEMM，算力 2×
+  4. 反量化：Y_fp = Y_int × s_x × s_w       ← 一个乘法
+</code></pre></div>
+
+<ul>
+<li><strong>加速来源</strong>：双重加速——显存带宽减半 + INT8 Tensor Core 算力是 FP16 的 2 倍</li>
+<li>难点：激活 X 的范围每次都不一样，必须<strong>动态计算 scale</strong>（每次 forward pass 都要算 max|X|）；且 X 中有 outlier（见 LLM.int8()），直接量化精度崩溃</li>
+<li>真正的 full INT8 推理需要非对称量化或 outlier 处理（如 LLM.int8()、SmoothQuant），工程复杂度高</li>
+</ul>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>类型</th>
+<th>量化什么</th>
+<th>加速来源</th>
+<th>精度损失</th>
+<th>代表方案</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Weight-only</td>
+<td>仅权重</td>
+<td>减少显存带宽</td>
+<td>小</td>
+<td>GPTQ, AWQ, GGUF</td>
+</tr>
+<tr>
+<td>Weight+Activation</td>
+<td>权重+激活</td>
+<td>带宽减半 + INT 算力 2×</td>
+<td>较大（需处理 outlier）</td>
+<td>LLM.int8(), SmoothQuant, FP8 E4M3</td>
+</tr>
+</tbody>
+</table></div>
+<blockquote class="callout callout-tip">
+<p>💡 你可能会问：FP8 属于哪种？FP8 是天然的 weight+activation 量化——权重和激活都用 E4M3 格式，直接在 FP8 Tensor Core 上做 GEMM。但 FP8 作为浮点数格式对 outlier 天然更鲁棒（相对误差均匀），所以不需要 LLM.int8() 那样的混合精度分解。这也是 FP8 被看好的另一个原因。</p>
+</blockquote>
+<p>Weight-only 量化目前在开源社区更主流（GPTQ/AWQ 生态成熟，llama.cpp、vLLM、TensorRT-LLM 都支持），但工业界部署正在快速转向 FP8（H100+ 上开箱即用，零算法复杂度）。</p>
+<h3 id="53-实测性能参考a100llama-2-70b">5.3 实测性能参考（A100，LLaMA-2-70B）</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>配置</th>
+<th>显存占用</th>
+<th>吞吐 (tokens/s)</th>
+<th>相对 FP16</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>FP16 (2×A100)</td>
+<td>~140 GB</td>
+<td>~800</td>
+<td>1.0×</td>
+</tr>
+<tr>
+<td>INT8 (1×A100)</td>
+<td>~70 GB</td>
+<td>~1200</td>
+<td>1.5×</td>
+</tr>
+<tr>
+<td>INT4 AWQ (1×A100)</td>
+<td>~35 GB</td>
+<td>~1500</td>
+<td>1.9×</td>
+</tr>
+</tbody>
+</table></div>
+<blockquote class="callout">
+<p>注意：吞吐提升不完全正比于带宽节省，因为还有其他开销（attention 计算、KV cache 访问等）。</p>
+</blockquote>
+<h2 id="6-量化实践速查表">6. 量化实践速查表</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>场景</th>
+<th>推荐方案</th>
+<th>理由</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>快速部署，精度优先</td>
+<td>FP8（如有 H100）或 INT8</td>
+<td>精度损失极小</td>
+</tr>
+<tr>
+<td>显存紧张，需要跑大模型</td>
+<td>GPTQ/AWQ INT4</td>
+<td>显存减半再减半</td>
+</tr>
+<tr>
+<td>需要微调 + 推理</td>
+<td>bitsandbytes NF4 + QLoRA</td>
+<td>微调友好</td>
+</tr>
+<tr>
+<td>极致性能，可接受质量损失</td>
+<td>INT4 + GPTQ + per-group-32</td>
+<td>最小显存+最快速度</td>
+</tr>
+<tr>
+<td>生产环境，求稳</td>
+<td>AWQ INT4</td>
+<td>鲁棒性好，集成方便</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="思考题">思考题</h2>
+<ol class="quiz-list"><li>为什么 per-group 量化比 per-tensor 量化精度好？group size 越小越好吗？<details class="answer"><summary>参考答案</summary><p>Per-tensor 用同一个 scale 量化整张权重矩阵，per-channel 对每个输出通道单独算 scale，per-group 更进一步把每 128 个元素（通常沿输入通道分组）分成一组各算 scale。越细粒度，scale 越能精准适配每组数值的实际范围——避免某些幅度大的组把 scale 拉大，导致幅度小的组被压缩到少数几个整数 level，量化误差增大。</p>
+<p>但 group size 不是越小越好：① scale 本身要存 FP16，group_size=128 时额外存储约 0.4%，group_size=32 时涨到 ~1.6%，虽然不大但也有开销；② 更重要的是，group 太小每组样本太少，max 统计值不稳定，反而引入噪声误差；③ 推理时反量化需要按 group 读 scale 并做乘法，太小的 group 导致访存模式碎片化，影响 GPU kernel 效率。实践中 group_size=128 是精度和效率的最佳平衡点（GPTQ/AWQ 都默认 128），64 精度提升已经很有限。</p></details></li><li>GPTQ 和 AWQ 的核心区别是什么？什么场景下选谁？<details class="answer"><summary>参考答案</summary><p>核心区别在误差处理方式：</p>
+<ul>
+<li>GPTQ：基于 Hessian 逆矩阵做逐输入通道量化 + 跨通道误差补偿，本质是"量化完这一列，用 Hessian 信息调整后面的列来补偿误差"，是一种二阶最优方法。</li>
+<li>AWQ：基于激活值幅度识别重要通道，通过 per-group 缩放因子保护重要通道精度，不修改权重之间的关系，没有误差传播问题。</li>
+</ul>
+<p>注意两者<strong>推理时完全相同</strong>——都是 INT4 权重 + per-group scale，没有推理速度差异。区别在量化过程：GPTQ 需要算 Hessian 逆 + 逐列迭代补偿，量化慢、实现复杂；AWQ 只需跑少量校准数据估计通道重要性 + 搜索缩放因子，量化快、实现简单鲁棒。</p>
+<p>场景选择：一般选 AWQ（简单、快、精度持平甚至更好）。如果追求极限精度且不介意量化时间，可以用 GPTQ。小模型（&lt;7B）或 outlier 严重的模型 AWQ 通常更稳。</p></details></li><li>Weight-only 量化为什么不直接加速矩阵乘法？那加速从何而来？<details class="answer"><summary>参考答案</summary><p>Weight-only 量化不直接加速矩阵乘法的原因：矩阵乘仍然在 FP16 下执行（X 是 FP16，W 反量化后也是 FP16，GEMM 本身是 FP16），INT8/INT4 Tensor Core 需要输入都是整数才能使用。</p>
+<p>加速来自<strong>显存带宽节省</strong>：Decode 阶段是 memory-bound，瓶颈是"从 HBM 读权重到 SRAM"的速度。权重从 FP16（2 字节/参数）压缩到 INT4（0.5 字节/参数），同样的 2 TB/s 带宽每秒能读到 4 倍的有效权重，GPU 等数据的时间大幅减少，decode 速度自然提升。本质上是"用廉价的反量化计算（一个乘加）换昂贵的显存带宽"。</p></details></li></ol>
+
+
+<hr>
+<p><em>下一章：<a href="04_parallelism_and_serving.html">04_parallelism_and_serving.md</a> —— 单卡搞不定，怎么切模型？怎么搭服务？</em></p><nav class="pager"><a class="pager-card" href="02_kv_cache_and_memory.html"><span class="pager-dir">← 上一章</span><span class="pager-title">02 · KV Cache 与内存优化</span></a><a class="pager-card pager-next" href="04_parallelism_and_serving.html"><span class="pager-dir">下一章 →</span><span class="pager-title">04 · 并行与服务架构</span></a></nav>
+  </article>
+  <aside class="toc"><div class="toc-title">本页目录</div><ul class="toc-list"><li class="toc-l1"><a href="#第三章量化-精度换速度到底怎么换" data-toc-link>第三章：量化 —— 精度换速度，到底怎么换？</a><ul class="toc-list"><li class="toc-l2"><a href="#1-为什么量化是推理优化的第一选择" data-toc-link>1. 为什么量化是推理优化的第一选择？</a></li><li class="toc-l2"><a href="#2-量化的基本方法" data-toc-link>2. 量化的基本方法</a><ul class="toc-list"><li class="toc-l3"><a href="#21-均匀量化uniform-quantization" data-toc-link>2.1 均匀量化（Uniform Quantization）</a></li><li class="toc-l3"><a href="#22-逐通道-vs-逐张量量化" data-toc-link>2.2 逐通道 vs 逐张量量化</a></li></ul></li><li class="toc-l2"><a href="#3-量化粒度ptq-vs-qat" data-toc-link>3. 量化粒度：PTQ vs QAT</a><ul class="toc-list"><li class="toc-l3"><a href="#31-post-training-quantizationptq训练后量化" data-toc-link>3.1 Post-Training Quantization（PTQ，训练后量化）</a></li><li class="toc-l3"><a href="#32-quantization-aware-trainingqat量化感知训练" data-toc-link>3.2 Quantization-Aware Training（QAT，量化感知训练）</a></li></ul></li><li class="toc-l2"><a href="#4-主流-ptq-方法详解" data-toc-link>4. 主流 PTQ 方法详解</a><ul class="toc-list"><li class="toc-l3"><a href="#41-llmint8bitsandbytes" data-toc-link>4.1 LLM.int8()（bitsandbytes）</a></li><li class="toc-l3"><a href="#42-gptq" data-toc-link>4.2 GPTQ</a></li><li class="toc-l3"><a href="#43-awqactivation-aware-weight-quantization" data-toc-link>4.3 AWQ（Activation-aware Weight Quantization）</a></li><li class="toc-l3"><a href="#44-fp8-量化" data-toc-link>4.4 FP8 量化</a></li></ul></li><li class="toc-l2"><a href="#5-量化后的推理加速" data-toc-link>5. 量化后的推理加速</a><ul class="toc-list"><li class="toc-l3"><a href="#51-权重量化-反量化开销" data-toc-link>5.1 权重量化 → 反量化开销？</a></li><li class="toc-l3"><a href="#52-weight-only-vs-weightactivation-量化" data-toc-link>5.2 Weight-Only vs Weight+Activation 量化</a></li><li class="toc-l3"><a href="#53-实测性能参考a100llama-2-70b" data-toc-link>5.3 实测性能参考（A100，LLaMA-2-70B）</a></li></ul></li><li class="toc-l2"><a href="#6-量化实践速查表" data-toc-link>6. 量化实践速查表</a></li><li class="toc-l2"><a href="#思考题" data-toc-link>思考题</a></li></ul></li></ul></aside>
+</main>
+<script src="../assets/blog.js?v=1788185626"></script>
+</body>
+</html>

@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 · 进阶优化技术 · LLM 推理优化</title>
+<meta name="description" content="Speculative Decoding、FlashAttention、Kernel Fusion、Prefix Caching。">
+<link rel="stylesheet" href="../assets/blog.css?v=1788185626">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2318181b'/%3E%3Ctext x='16' y='22' font-family='Menlo,monospace' font-size='17' font-weight='600' fill='%23fafafa' text-anchor='middle'%3E%CE%BB%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<header class="site-header">
+  <div class="container header-inner">
+    <a class="brand" href="../index.html">
+      <span class="brand-mark">λ</span>
+      <span class="brand-name">LLM 推理优化</span>
+    </a>
+    <nav class="site-nav"><a href="../chapters/01_inference_fundamentals.html" title="第 01 章">01</a><a href="../chapters/02_kv_cache_and_memory.html" title="第 02 章">02</a><a href="../chapters/03_quantization.html" title="第 03 章">03</a><a href="../chapters/04_parallelism_and_serving.html" title="第 04 章">04</a><a href="../chapters/05_advanced_techniques.html" title="第 05 章">05</a><a href="../chapters/06_framework_ecosystem.html" title="第 06 章">06</a><a href="../chapters/07_cluster_and_infra.html" title="第 07 章">07</a></nav>
+    <details class="mobile-nav">
+      <summary>章节</summary>
+      <div class="mobile-nav-panel"><a href="../chapters/01_inference_fundamentals.html" title="第 01 章">01</a><a href="../chapters/02_kv_cache_and_memory.html" title="第 02 章">02</a><a href="../chapters/03_quantization.html" title="第 03 章">03</a><a href="../chapters/04_parallelism_and_serving.html" title="第 04 章">04</a><a href="../chapters/05_advanced_techniques.html" title="第 05 章">05</a><a href="../chapters/06_framework_ecosystem.html" title="第 06 章">06</a><a href="../chapters/07_cluster_and_infra.html" title="第 07 章">07</a></div>
+    </details>
+  </div>
+</header>
+<main class="container main-grid">
+  <article class="prose">
+<div class="chapter-head"><div class="breadcrumb"><a href="../index.html">首页</a><span class="sep">/</span>第 05 章</div></div><h1 id="第五章进阶优化技术-还有哪些黑科技">第五章：进阶优化技术 —— 还有哪些黑科技？</h1>
+<h2 id="1-speculative-decoding投机解码">1. Speculative Decoding（投机解码）</h2>
+<figure class="anim-figure"><figcaption><span class="anim-badge"><svg viewBox="0 0 24 24" fill="currentColor" width="11" height="11"><path d="M8 5.5v13l11-6.5z"/></svg>动画演示</span><span class="anim-title">Speculative Decoding：猜 + 验证</span><a class="anim-open" href="../animations/speculative-decoding/index.html?autoplay=1" target="_blank" rel="noopener">新窗口打开<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="11" height="11"><path d="M7 17L17 7M9 7h8v8"/></svg></a></figcaption><div class="anim-embed"><iframe src="../animations/speculative-decoding/index.html?autoplay=1" title="Speculative Decoding：猜 + 验证" loading="lazy" scrolling="no"></iframe></div><p class="anim-caption">小模型一次猜 γ 个 token，大模型用一次前向传播并行验证；接受前缀、截断分叉点，串行 5 步变 2 步。</p></figure>
+<h3 id="11-问题decode-的串行性">1.1 问题：Decode 的串行性</h3>
+<p>Decode 每步只生成一个 token，且<strong>下一步必须依赖上一步的结果</strong>（自回归）。即使 GPU 算力有富余，也无法并行生成多个 token。</p>
+<h3 id="12-核心思想猜-验证">1.2 核心思想：猜 + 验证</h3>
+<div class="codehilite"><pre><span></span><code>用一个小模型（draft model）快速"猜" k 个 token
+用大模型（target model）一次性验证这 k 个 token
+接受的保留，拒绝的从拒绝点重新生成
+
+时间线：
+  传统: [t1] → [t2] → [t3] → [t4] → [t5]    5步
+  投机: [draft: t1,t2,t3,t4] → [verify all]    1步draft + 1步verify
+                                          如果全对 → 5步变2步！
+</code></pre></div>
+
+<h3 id="13-为什么能加速">1.3 为什么能加速？</h3>
+<p><strong>关键洞察</strong>：大模型验证 k 个 token 只需要<strong>一次前向传播</strong>（prefill 形式），而串行生成 k 个 token 需要 k 次前向传播。</p>
+<div class="codehilite"><pre><span></span><code>验证过程：
+  把猜的 k 个 token 拼到序列后面
+  一次前向传播得到每个位置的 logits
+  对比每个位置的预测与 draft 的猜测
+  从第 1 个不匹配的位置截断
+</code></pre></div>
+
+<h3 id="14-加速比分析">1.4 加速比分析</h3>
+<p>假设 draft 模型的接受率为 α（每个 token 被大模型接受的概率）：</p>
+<div class="codehilite"><pre><span></span><code>每轮投机：
+  draft 生成 γ 个 token → 花费 γ × t_draft 时间
+  target 验证 → 花费 1 × t_target 时间（一次前向传播）
+
+  平均接受的 token 数 = 1 + α + α² + ... + α^(γ-1) = (1 - α^γ) / (1 - α)
+
+加速比 ≈ (1 - α^γ) / ((1 - α) × (γ × t_draft/t_target + 1))
+</code></pre></div>
+
+<p>当 α 较高（draft 模型质量接近 target）、t_draft &lt;&lt; t_target 时，加速比可达 2-3x。</p>
+<h3 id="15-变体">1.5 变体</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>变体</th>
+<th>Draft 来源</th>
+<th>特点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Classic Speculative Decoding</td>
+<td>独立小模型</td>
+<td>最简单，但需要额外模型</td>
+</tr>
+<tr>
+<td>Self-speculative</td>
+<td>同一模型早退（skip layers）</td>
+<td>不需要额外模型</td>
+</tr>
+<tr>
+<td>Medusa</td>
+<td>多头并行预测</td>
+<td>不需要 draft 模型，训练额外的 prediction heads</td>
+</tr>
+<tr>
+<td>Eagle</td>
+<td>用特征预测而非 token 级别</td>
+<td>更高效，接受率更高</td>
+</tr>
+<tr>
+<td>Lookahead Decoding</td>
+<td>Jacobi 迭代并行</td>
+<td>不需要额外模型/训练</td>
+</tr>
+</tbody>
+</table></div>
+<blockquote class="callout callout-warn">
+<p>⚠️ <strong>算法同学的直觉误区</strong>：你可能以为投机解码"猜错了要重来，效率更低"。但实际上，即使只有 70% 的接受率，每轮平均也能产出 2-3 个 token，因为一次验证的开销远小于多次串行 decode。</p>
+</blockquote>
+<h2 id="2-flashattention">2. FlashAttention</h2>
+<figure class="anim-figure"><figcaption><span class="anim-badge"><svg viewBox="0 0 24 24" fill="currentColor" width="11" height="11"><path d="M8 5.5v13l11-6.5z"/></svg>动画演示</span><span class="anim-title">FlashAttention：Tiling + Online Softmax</span><a class="anim-open" href="../animations/flash-attention/index.html?autoplay=1" target="_blank" rel="noopener">新窗口打开<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="11" height="11"><path d="M7 17L17 7M9 7h8v8"/></svg></a></figcaption><div class="anim-embed"><iframe src="../animations/flash-attention/index.html?autoplay=1" title="FlashAttention：Tiling + Online Softmax" loading="lazy" scrolling="no"></iframe></div><p class="anim-caption">把 Q/K/V 分块搬进 SRAM，用 running max/sum 在线归并，从不把 N² 的注意力矩阵写进 HBM。</p></figure>
+<h3 id="21-标准-attention-的显存问题">2.1 标准 Attention 的显存问题</h3>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 标准 Attention</span>
+<span class="n">Q</span><span class="p">,</span> <span class="n">K</span><span class="p">,</span> <span class="n">V</span> <span class="o">=</span> <span class="o">...</span>  <span class="c1"># [batch, heads, seq_len, d_head]</span>
+<span class="n">S</span> <span class="o">=</span> <span class="n">Q</span> <span class="o">@</span> <span class="n">K</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="o">-</span><span class="mi">2</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>  <span class="c1"># [batch, heads, seq_len, seq_len] ← 巨大的中间矩阵！</span>
+<span class="n">P</span> <span class="o">=</span> <span class="n">softmax</span><span class="p">(</span><span class="n">S</span><span class="p">)</span>               <span class="c1"># [batch, heads, seq_len, seq_len] ← 又一份大矩阵</span>
+<span class="n">O</span> <span class="o">=</span> <span class="n">P</span> <span class="o">@</span> <span class="n">V</span>                    <span class="c1"># [batch, heads, seq_len, d_head]</span>
+</code></pre></div>
+
+<p>问题：</p>
+<ol>
+<li><strong>显存</strong>：S 和 P 的大小为 O(N²)，序列长度 8192 时，每个 head 就占 256MB（FP16）</li>
+<li><strong>读写</strong>：S 写到 HBM → 读出来做 softmax → 写回 HBM → 再读出来做 @V，大量 HBM 读写</li>
+</ol>
+<h3 id="22-flashattention-的核心tiling-online-softmax">2.2 FlashAttention 的核心：Tiling + Online Softmax</h3>
+<p><strong>关键洞察</strong>：我们不需要完整的 S 矩阵，只需要最终的 O。能不能不把 S 存到 HBM？</p>
+<div class="codehilite"><pre><span></span><code>FlashAttention 的做法：
+  1. 把 Q, K, V 分成小块（tiles），放入 SRAM（高速缓存）
+  2. 在 SRAM 中计算局部 attention
+  3. 用 online softmax 技巧逐步合并结果
+  4. 只把最终的 O 写回 HBM
+
+  → 不需要存储完整的 N×N attention 矩阵
+  → 显存从 O(N²) 降到 O(N)
+  → HBM 访问次数大幅减少 → 速度提升
+</code></pre></div>
+
+<p><strong>Online Softmax</strong>：分块计算 softmax 的关键</p>
+<div class="codehilite"><pre><span></span><code>标准 softmax: softmax(x) = exp(x - max(x)) / sum(exp(x - max(x)))
+
+分块计算:
+  块1: 局部 max₁, 局部 sum₁
+  块2: 局部 max₂, 局部 sum₂
+
+  全局 max = max(max₁, max₂)
+  全局 sum = 校正后的 sum₁ + 校正后的 sum₂
+
+  每处理一个新块，用校正因子更新之前的累积结果
+</code></pre></div>
+
+<h3 id="23-flashattention-的版本演进">2.3 FlashAttention 的版本演进</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>版本</th>
+<th>改进</th>
+<th>加速效果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>FlashAttention-1</td>
+<td>基础 tiling + online softmax</td>
+<td>2-4x</td>
+</tr>
+<tr>
+<td>FlashAttention-2</td>
+<td>更好的 work partitioning，减少 non-matmul FLOPs</td>
+<td>比 FA1 快 2x</td>
+</tr>
+<tr>
+<td>FlashAttention-3</td>
+<td>利用 H100 的异步 + FP8 + TF32</td>
+<td>比 FA2 快 1.5-2x</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="24-对推理的影响">2.4 对推理的影响</h3>
+<ul>
+<li><strong>Prefill 阶段</strong>：加速明显（长序列时 2-4x），因为 prefill 是 compute-bound，FlashAttention 减少了大量冗余的 HBM 访问</li>
+<li><strong>Decode 阶段</strong>：加速有限，因为 decode 每次只处理 1 个 token，attention 矩阵很小。FlashAttention 主要减少的是 KV cache 的读取次数（Flash-Decoding）</li>
+</ul>
+<blockquote class="callout callout-tip">
+<p>💡 <strong>算法同学注意</strong>：FlashAttention 不改变数学结果（数值上等价于标准 attention，精度差异可忽略），纯粹是工程优化。你可以放心使用，不影响模型行为。</p>
+</blockquote>
+<h2 id="3-kernel-fusion算子融合">3. Kernel Fusion（算子融合）</h2>
+<h3 id="31-问题小算子的开销">3.1 问题：小算子的开销</h3>
+<p>一个 Transformer 层包含大量小算子：</p>
+<div class="dg">
+  <div class="dg-cells" style="flex-wrap:wrap;row-gap:6px">
+    <i class="c-blue">LayerNorm</i>→<i class="c-blue">QKV Proj</i>→<i class="c-blue">Bias Add</i>→<i class="c-blue">Rotary</i>→<i class="c-violet">Attention</i>→<i class="c-blue">O Proj</i>→<i class="c-green">Residual</i>→<i class="c-blue">LayerNorm</i>→<i class="c-blue">Gate/Up Proj</i>→<i class="c-blue">Activation</i>→<i class="c-blue">Down Proj</i>→<i class="c-blue">Bias Add</i>→<i class="c-green">Residual</i>
+  </div>
+  <div class="dg-cap">一个 Transformer 层里的小算子链——每个箭头都是一次潜在的 kernel 边界</div>
+</div>
+
+<p>每个算子都需要：读输入 → 计算 → 写输出。如果分开执行，<strong>每次都要从 HBM 读、写 HBM</strong>。</p>
+<div class="dg">
+  <div class="dg-lanes" style="min-width:0">
+    <div class="dg-row" style="grid-template-columns:70px 1fr"><span class="dg-lab">未融合</span><span class="dg-cells" style="flex-wrap:wrap;row-gap:6px"><i class="c-red">HBM</i>→<i class="c-blue">LayerNorm</i>→<i class="c-red">HBM</i>→<i class="c-blue">QKV Proj</i>→<i class="c-red">HBM</i>→<i class="c-blue">Bias</i>→<i class="c-red">HBM</i>→…</span></div>
+    <div class="dg-row" style="grid-template-columns:70px 1fr"><span class="dg-lab"></span><span class="dg-note-line" style="color:#b91c1c">每个算子之间都有一次 HBM 读写</span></div>
+    <div class="dg-row" style="grid-template-columns:70px 1fr"><span class="dg-lab">融合后</span><span class="dg-cells" style="flex-wrap:wrap;row-gap:6px"><i class="c-red">HBM</i>→<i class="c-green">LayerNorm + QKV Proj + Bias + Rotary</i>→<i class="c-red">HBM</i></span></div>
+    <div class="dg-row" style="grid-template-columns:70px 1fr"><span class="dg-lab"></span><span class="dg-note-line" style="color:#047857">一次读取、一次写回，中间结果留在 SRAM / 寄存器</span></div>
+  </div>
+</div>
+
+<h3 id="32-常见融合模式">3.2 常见融合模式</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>融合模式</th>
+<th>融合的算子</th>
+<th>省掉的开销</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>QKV Bias + Rotary</td>
+<td>bias add + RoPE</td>
+<td>2次 HBM 读写</td>
+</tr>
+<tr>
+<td>LayerNorm + Residual</td>
+<td>LN + add</td>
+<td>1次 HBM 读写</td>
+</tr>
+<tr>
+<td>Activation + Bias + Residual</td>
+<td>SiLU + bias + add</td>
+<td>2次 HBM 读写</td>
+</tr>
+<tr>
+<td>Attention 融合</td>
+<td>QK^T + softmax + dropout + AV</td>
+<td>2-3次 HBM 读写</td>
+</tr>
+<tr>
+<td>全层融合</td>
+<td>整个 Transformer 层</td>
+<td>大量 HBM 读写</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="33-实现方式">3.3 实现方式</h3>
+<ol>
+<li><strong>CUDA 手写 Kernel</strong>：性能最好，但开发成本高</li>
+<li><strong>Triton</strong>：OpenAI 的 DSL，比 CUDA 更高层，FlashAttention 就有 Triton 实现</li>
+<li><strong>torch.compile</strong>：PyTorch 的 JIT 编译器，自动融合算子</li>
+<li><strong>TensorRT / cuBLASLt</strong>：NVIDIA 提供的融合算子库</li>
+</ol>
+<blockquote class="callout callout-warn">
+<p>⚠️ 生产级推理引擎（vLLM、TensorRT-LLM）大量使用手写 CUDA/Triton kernel 来融合算子，这是它们比纯 PyTorch 快的重要原因之一。</p>
+</blockquote>
+<h2 id="4-prefix-caching">4. Prefix Caching</h2>
+<h3 id="41-场景">4.1 场景</h3>
+<p>很多请求有相同的 system prompt（如"你是一个有用的助手..."），重复计算这些 token 的 KV Cache 是浪费。</p>
+<h3 id="42-做法">4.2 做法</h3>
+<div class="codehilite"><pre><span></span><code>1. 首次遇到某个 prompt prefix → 正常计算，将 KV Cache 存入缓存
+2. 后续请求有相同 prefix → 直接复用缓存的 KV Cache，跳过 prefill
+
+请求1: [system_prompt | 用户问题1] → 计算完整 KV，缓存 system_prompt 部分
+请求2: [system_prompt | 用户问题2] → 复用 system_prompt 的 KV，只 prefill 用户问题2
+</code></pre></div>
+
+<p><strong>vLLM 的 Automatic Prefix Caching (APC)</strong> 就是这个思路，利用 PagedAttention 的 block 粒度做引用计数，多请求共享同一个 prefix block。</p>
+<h3 id="43-radixattentionsglang-的方法">4.3 RadixAttention（SGLang 的方法）</h3>
+<p>用 Radix Tree 管理前缀缓存，支持更灵活的复用：</p>
+<div class="dg dg-tree">
+  <ul>
+    <li><span class="root">Radix Tree（root）</span>
+      <ul>
+        <li>"你是一个" → <span class="pill pill-violet">KV block 0-1</span>
+          <ul>
+            <li>"有用的助手" → <span class="pill pill-violet">KV block 2-3</span> <span class="dim">← system_prompt_v1</span></li>
+            <li>"代码专家" → <span class="pill pill-violet">KV block 4-5</span> <span class="dim">← system_prompt_v2</span></li>
+          </ul>
+        </li>
+        <li>"Translate" → <span class="pill pill-violet">KV block 6-7</span> <span class="dim">← 常见任务</span></li>
+      </ul>
+    </li>
+  </ul>
+  <div class="dg-cap">新请求沿树匹配最长公共前缀 → 直接复用对应 KV blocks，共享前缀的部分零 prefill</div>
+</div>
+
+<h2 id="5-其他值得关注的优化">5. 其他值得关注的优化</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>技术</th>
+<th>一句话说明</th>
+<th>适用场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>MoE 稀疏推理</strong></td>
+<td>每个 token 只激活部分 expert，减少计算</td>
+<td>Mixtral、DeepSeek-MoE</td>
+</tr>
+<tr>
+<td><strong>Draft Model in Head</strong></td>
+<td>用 LM head 做多 token 预测</td>
+<td>自投机解码</td>
+</tr>
+<tr>
+<td><strong>CAVA</strong></td>
+<td>Convolution-Augmented Attention，加速 decode</td>
+<td>实验性</td>
+</tr>
+<tr>
+<td><strong>Split-K Fusion</strong></td>
+<td>并行化 reduce 操作</td>
+<td>大 batch matmul</td>
+</tr>
+<tr>
+<td><strong>CUDA Graph</strong></td>
+<td>捕获整个推理循环为 CUDA Graph，减少 CPU launch 开销</td>
+<td>小 batch decode</td>
+</tr>
+<tr>
+<td><strong>Quantized KV Cache</strong></td>
+<td>KV Cache 也做 INT8/FP8 量化</td>
+<td>长上下文场景</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="思考题">思考题</h2>
+<ol class="quiz-list"><li>Speculative Decoding 的加速比取决于什么？如果 draft 模型特别小（接受率 50%），还有加速效果吗？<details class="answer"><summary>参考答案</summary><p>三个变量：接受率 α、每轮投机 token 数 γ、draft/target 单步耗时比 c = t_draft/t_target。本章公式：加速比 ≈ (1-α^γ) / ((1-α)·(γ·c + 1))。</p>
+<p>α=50% 仍然有效，只要 draft 足够便宜。γ=5 时每轮期望产出 (1-0.5⁵)/(1-0.5) ≈ 1.94 个 token；若 draft 耗时是 target 的 1/50（c=0.02），一轮成本 = 5×0.02+1 = 1.1 倍单步 decode → 加速 ≈ 1.94/1.1 ≈ <strong>1.76×</strong>。</p>
+<p>直觉：加速比的敌人不是低接受率，而是贵 draft。接受率低只是每轮平均产出少（但仍 &gt;1）；draft 慢则每轮成本直接膨胀，c→1 时加速比必然 &lt;1。所以工程上选 draft 的第一标准是小而快（比 target 小 1-2 个数量级），其次才是猜得准。</p></details></li><li>FlashAttention 为什么对 decode 阶段加速有限？decode 阶段应该怎么优化 attention？<details class="answer"><summary>参考答案</summary><p>FlashAttention 优化的是 attention 计算过程的访存模式：通过 tiling + 在线 softmax，避免把 N×N 注意力矩阵物化到 HBM，把 O(N²) 的 HBM 读写降到 O(N)。这是 prefill 的痛点（Q 有 N 行）。</p>
+<p>Decode 时 q_len=1：注意力矩阵只有 1×N，本来就没有 N² 物化问题。此时瓶颈是"从 HBM 读全部历史 K/V"（KV Cache 读取），FlashAttention 并不减少这部分——K/V 每个字节都必须读。</p>
+<p>Decode 阶段的 attention 优化方向是减少 KV 读取量和提高并行度：① GQA/MQA 直接砍掉 K/V 的 head 数（第 2 章）；② KV Cache 量化（INT8/FP8 KV，读取字节数减半）；③ Flash-Decoding：把 KV 序列切给不同 SM 并行处理再归并，解决小 batch 时 SM 利用不足的问题（提并行度，不减读取量）。</p></details></li><li>Kernel Fusion 的本质是减少了什么开销？为什么 PyTorch eager mode 做不到？<details class="answer"><summary>参考答案</summary><p>减少两类开销，第二类是大头：</p>
+<p>① Kernel launch 开销：每个 CUDA kernel 启动有 ~5-10μs 的 CPU 调度成本，小 batch decode 一步要启动几十上百个 kernel，launch 间隙 GPU 空转。</p>
+<p>② 中间结果的 HBM 往返：独立 kernel 的每个算子把输出写回 HBM、下一个算子再读回来；融合后中间结果留在寄存器/SRAM 里。对 memory-bound 的 decode，每一次 HBM 往返都是实打实的延迟。</p>
+<p>PyTorch eager mode 做不到，因为它逐算子派发执行：Python 解释一行、调一个预编译 kernel，执行时拿不到完整计算图，无从知道哪几个算子可以合并。融合需要全局视图：torch.compile（Inductor）、TensorRT、XLA 这类编译器先捕获整图，再生成融合 kernel。CUDA Graph 解决的是第①类（把整段 kernel 序列录下来一次回放），两者互补。</p></details></li></ol>
+
+
+<hr>
+<p><em>下一章：<a href="06_framework_ecosystem.html">06_framework_ecosystem.md</a> —— 生产环境用什么框架？怎么选？</em></p><nav class="pager"><a class="pager-card" href="04_parallelism_and_serving.html"><span class="pager-dir">← 上一章</span><span class="pager-title">04 · 并行与服务架构</span></a><a class="pager-card pager-next" href="06_framework_ecosystem.html"><span class="pager-dir">下一章 →</span><span class="pager-title">06 · 推理框架生态</span></a></nav>
+  </article>
+  <aside class="toc"><div class="toc-title">本页目录</div><ul class="toc-list"><li class="toc-l1"><a href="#第五章进阶优化技术-还有哪些黑科技" data-toc-link>第五章：进阶优化技术 —— 还有哪些黑科技？</a><ul class="toc-list"><li class="toc-l2"><a href="#1-speculative-decoding投机解码" data-toc-link>1. Speculative Decoding（投机解码）</a><ul class="toc-list"><li class="toc-l3"><a href="#11-问题decode-的串行性" data-toc-link>1.1 问题：Decode 的串行性</a></li><li class="toc-l3"><a href="#12-核心思想猜-验证" data-toc-link>1.2 核心思想：猜 + 验证</a></li><li class="toc-l3"><a href="#13-为什么能加速" data-toc-link>1.3 为什么能加速？</a></li><li class="toc-l3"><a href="#14-加速比分析" data-toc-link>1.4 加速比分析</a></li><li class="toc-l3"><a href="#15-变体" data-toc-link>1.5 变体</a></li></ul></li><li class="toc-l2"><a href="#2-flashattention" data-toc-link>2. FlashAttention</a><ul class="toc-list"><li class="toc-l3"><a href="#21-标准-attention-的显存问题" data-toc-link>2.1 标准 Attention 的显存问题</a></li><li class="toc-l3"><a href="#22-flashattention-的核心tiling-online-softmax" data-toc-link>2.2 FlashAttention 的核心：Tiling + Online Softmax</a></li><li class="toc-l3"><a href="#23-flashattention-的版本演进" data-toc-link>2.3 FlashAttention 的版本演进</a></li><li class="toc-l3"><a href="#24-对推理的影响" data-toc-link>2.4 对推理的影响</a></li></ul></li><li class="toc-l2"><a href="#3-kernel-fusion算子融合" data-toc-link>3. Kernel Fusion（算子融合）</a><ul class="toc-list"><li class="toc-l3"><a href="#31-问题小算子的开销" data-toc-link>3.1 问题：小算子的开销</a></li><li class="toc-l3"><a href="#32-常见融合模式" data-toc-link>3.2 常见融合模式</a></li><li class="toc-l3"><a href="#33-实现方式" data-toc-link>3.3 实现方式</a></li></ul></li><li class="toc-l2"><a href="#4-prefix-caching" data-toc-link>4. Prefix Caching</a><ul class="toc-list"><li class="toc-l3"><a href="#41-场景" data-toc-link>4.1 场景</a></li><li class="toc-l3"><a href="#42-做法" data-toc-link>4.2 做法</a></li><li class="toc-l3"><a href="#43-radixattentionsglang-的方法" data-toc-link>4.3 RadixAttention（SGLang 的方法）</a></li></ul></li><li class="toc-l2"><a href="#5-其他值得关注的优化" data-toc-link>5. 其他值得关注的优化</a></li><li class="toc-l2"><a href="#思考题" data-toc-link>思考题</a></li></ul></li></ul></aside>
+</main>
+<script src="../assets/blog.js?v=1788185626"></script>
+</body>
+</html>

@@ -1,0 +1,419 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>06 · 推理框架生态 · LLM 推理优化</title>
+<meta name="description" content="vLLM / TensorRT-LLM / SGLang / TGI / LMDeploy 对比，选型决策树与学习资源。">
+<link rel="stylesheet" href="../assets/blog.css?v=1788185626">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2318181b'/%3E%3Ctext x='16' y='22' font-family='Menlo,monospace' font-size='17' font-weight='600' fill='%23fafafa' text-anchor='middle'%3E%CE%BB%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<header class="site-header">
+  <div class="container header-inner">
+    <a class="brand" href="../index.html">
+      <span class="brand-mark">λ</span>
+      <span class="brand-name">LLM 推理优化</span>
+    </a>
+    <nav class="site-nav"><a href="../chapters/01_inference_fundamentals.html" title="第 01 章">01</a><a href="../chapters/02_kv_cache_and_memory.html" title="第 02 章">02</a><a href="../chapters/03_quantization.html" title="第 03 章">03</a><a href="../chapters/04_parallelism_and_serving.html" title="第 04 章">04</a><a href="../chapters/05_advanced_techniques.html" title="第 05 章">05</a><a href="../chapters/06_framework_ecosystem.html" title="第 06 章">06</a><a href="../chapters/07_cluster_and_infra.html" title="第 07 章">07</a></nav>
+    <details class="mobile-nav">
+      <summary>章节</summary>
+      <div class="mobile-nav-panel"><a href="../chapters/01_inference_fundamentals.html" title="第 01 章">01</a><a href="../chapters/02_kv_cache_and_memory.html" title="第 02 章">02</a><a href="../chapters/03_quantization.html" title="第 03 章">03</a><a href="../chapters/04_parallelism_and_serving.html" title="第 04 章">04</a><a href="../chapters/05_advanced_techniques.html" title="第 05 章">05</a><a href="../chapters/06_framework_ecosystem.html" title="第 06 章">06</a><a href="../chapters/07_cluster_and_infra.html" title="第 07 章">07</a></div>
+    </details>
+  </div>
+</header>
+<main class="container main-grid">
+  <article class="prose">
+<div class="chapter-head"><div class="breadcrumb"><a href="../index.html">首页</a><span class="sep">/</span>第 06 章</div></div><h1 id="第六章推理框架生态-生产环境用什么">第六章：推理框架生态 —— 生产环境用什么？</h1>
+<h2 id="1-框架全景">1. 框架全景</h2>
+<div class="codehilite"><pre><span></span><code>                    ┌─────────────────────┐
+                    │   应用层 (API)       │
+                    │  OpenAI-compatible  │
+                    └──────────┬──────────┘
+                               │
+                    ┌──────────▼──────────┐
+                    │   推理框架层         │
+                    │  vLLM / TGI / SGLang │
+                    │  TensorRT-LLM / LMDeploy │
+                    └──────────┬──────────┘
+                               │
+              ┌────────────────┼────────────────┐
+              │                │                │
+     ┌────────▼───────┐ ┌─────▼──────┐ ┌───────▼───────┐
+     │   CUDA Kernel  │ │ PyTorch /  │ │  TensorRT /   │
+     │   (手写算子)    │ │  TorchCompile│ │  ONNX Runtime │
+     └────────┬───────┘ └─────┬──────┘ └───────┬───────┘
+              │                │                │
+              └────────────────┼────────────────┘
+                               │
+                    ┌──────────▼──────────┐
+                    │   GPU Driver / CUDA │
+                    └─────────────────────┘
+</code></pre></div>
+
+<h2 id="2-主流框架对比">2. 主流框架对比</h2>
+<h3 id="21-vllm">2.1 vLLM</h3>
+<p><strong>定位</strong>：最流行的开源 LLM 推理引擎</p>
+<p><strong>核心特性</strong>：</p>
+<ul>
+<li>PagedAttention（核心创新，KV Cache 高效管理）</li>
+<li>Continuous Batching</li>
+<li>支持 TP（不含 PP）</li>
+<li>支持 GPTQ / AWQ / FP8 量化</li>
+<li>Prefix Caching</li>
+<li>Speculative Decoding（支持多种 draft 模型）</li>
+<li>OpenAI 兼容 API</li>
+</ul>
+<p><strong>优点</strong>：</p>
+<ul>
+<li>社区活跃，模型支持最广</li>
+<li>开箱即用，配置简单</li>
+<li>PagedAttention 效果确实好</li>
+</ul>
+<p><strong>缺点</strong>：</p>
+<ul>
+<li>单机为主，多机支持不如 TRT-LLM</li>
+<li>部分模型的支持有 bug（社区在快速修复）</li>
+<li>调度策略不够灵活</li>
+</ul>
+<p><strong>适合场景</strong>：大多数 LLM 推理需求，尤其是中小规模部署</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 最简启动</span>
+python<span class="w"> </span>-m<span class="w"> </span>vllm.entrypoints.openai.api_server<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--model<span class="w"> </span>meta-llama/Llama-2-7b-hf<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--tensor-parallel-size<span class="w"> </span><span class="m">2</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--quantization<span class="w"> </span>awq
+</code></pre></div>
+
+<h3 id="22-tensorrt-llmnvidia">2.2 TensorRT-LLM（NVIDIA）</h3>
+<p><strong>定位</strong>：NVIDIA 官方的高性能推理引擎</p>
+<p><strong>核心特性</strong>：</p>
+<ul>
+<li>高度优化的 CUDA kernel（NVIDIA 手写）</li>
+<li>FP8 / INT8 / INT4 量化（与 NVIDIA 硬件深度绑定）</li>
+<li>TP + PP 支持</li>
+<li>Inflight Batching（NVIDIA 版 continuous batching）</li>
+<li>KV Cache 管理</li>
+<li>TensorRT 图优化 + kernel fusion</li>
+</ul>
+<p><strong>优点</strong>：</p>
+<ul>
+<li>性能通常是所有框架中最高的</li>
+<li>多机多卡支持成熟</li>
+<li>与 NVIDIA 硬件（H100、L40S）配合最好</li>
+</ul>
+<p><strong>缺点</strong>：</p>
+<ul>
+<li>门槛高，配置复杂</li>
+<li>模型支持需要手动定义（写 Python 建模代码）</li>
+<li>编译时间长（构建 engine 需要几分钟到几十分钟）</li>
+<li>开源社区不如 vLLM 活跃</li>
+</ul>
+<p><strong>适合场景</strong>：大规模生产部署，尤其是 NVIDIA GPU 集群</p>
+<h3 id="23-sglang">2.3 SGLang</h3>
+<p><strong>定位</strong>：高效推理 + 灵活编程的框架</p>
+<p><strong>核心特性</strong>：</p>
+<ul>
+<li>RadixAttention（基于 Radix Tree 的 KV Cache 复用）</li>
+<li>Continuous Batching</li>
+<li>TP 支持</li>
+<li>编程模型：用 SGLang DSL 编写复杂 LLM 程序（多轮、分支、约束）</li>
+<li>与 vLLM 的 PagedAttention 不同，用 Radix Tree 管理前缀</li>
+</ul>
+<p><strong>优点</strong>：</p>
+<ul>
+<li>前缀复用效率极高（RadixAttention）</li>
+<li>编程模型灵活，适合复杂 LLM 应用</li>
+<li>性能在很多场景下优于 vLLM</li>
+</ul>
+<p><strong>缺点</strong>：</p>
+<ul>
+<li>社区规模小于 vLLM</li>
+<li>生态不如 vLLM 完善</li>
+</ul>
+<p><strong>适合场景</strong>：多轮对话、agent 场景（大量 prefix 复用）、需要编程灵活性</p>
+<h3 id="24-tgihuggingface-text-generation-inference">2.4 TGI（HuggingFace Text Generation Inference）</h3>
+<p><strong>定位</strong>：HuggingFace 官方的推理服务</p>
+<p><strong>核心特性</strong>：</p>
+<ul>
+<li>Continuous Batching</li>
+<li>量化支持（bitsandbytes / GPTQ / AWQ）</li>
+<li>Watermarking</li>
+<li>HuggingFace 模型无缝集成</li>
+</ul>
+<p><strong>优点</strong>：</p>
+<ul>
+<li>与 HuggingFace 生态无缝</li>
+<li>Docker 部署方便</li>
+<li>水印等安全特性</li>
+</ul>
+<p><strong>缺点</strong>：</p>
+<ul>
+<li>性能不如 vLLM / TRT-LLM</li>
+<li>定制化能力弱</li>
+</ul>
+<p><strong>适合场景</strong>：快速验证、HuggingFace 生态用户</p>
+<h3 id="25-lmdeploy">2.5 LMDeploy</h3>
+<p><strong>定位</strong>：商汤科技的高性能推理框架</p>
+<p><strong>核心特性</strong>：</p>
+<ul>
+<li>Turbomind 推理引擎（C++ 实现）</li>
+<li>W4A16 量化（AWQ INT4 权重 + FP16 激活）</li>
+<li>Continuous Batching</li>
+<li>KV Cache 管理</li>
+</ul>
+<p><strong>优点</strong>：</p>
+<ul>
+<li>INT4 推理性能优秀</li>
+<li>C++ 实现，内存开销小</li>
+</ul>
+<p><strong>缺点</strong>：</p>
+<ul>
+<li>社区规模较小</li>
+<li>模型支持范围不如 vLLM</li>
+</ul>
+<h2 id="3-框架选型决策树">3. 框架选型决策树</h2>
+<div class="dg dg-tree">
+  <ul>
+    <li><span class="root">需要极致性能？</span>
+      <ul>
+        <li><span class="yes">是</span> → <b>NVIDIA GPU + TensorRT-LLM</b></li>
+        <li><span class="no">否</span> → <span class="em">需要多机多卡？</span>
+          <ul>
+            <li><span class="yes">是</span> → <b>TensorRT-LLM 或 vLLM (TP)</b></li>
+            <li><span class="no">否</span> → <span class="em">大量前缀复用 / Agent 场景？</span>
+              <ul>
+                <li><span class="yes">是</span> → <b>SGLang</b></li>
+                <li><span class="no">否</span> → <span class="em">快速上手？</span>
+                  <ul>
+                    <li><span class="yes">是</span> → <b>vLLM</b></li>
+                    <li><span class="no">否</span> → 看具体需求</li>
+                  </ul>
+                </li>
+              </ul>
+            </li>
+          </ul>
+        </li>
+      </ul>
+    </li>
+  </ul>
+</div>
+
+<h2 id="4-推理性能优化-checklist">4. 推理性能优化 Checklist</h2>
+<p>当你需要优化一个 LLM 推理服务时，按优先级做：</p>
+<div class="codehilite"><pre><span></span><code>□ 1. 量化
+     最简单、收益最大的优化
+     AWQ INT4 或 FP8（如有 H100）
+
+□ 2. Continuous Batching
+     确保你的框架启用了 continuous batching
+     vLLM / SGLang 默认开启
+
+□ 3. KV Cache 管理
+     PagedAttention (vLLM) 或 RadixAttention (SGLang)
+     开启 prefix caching（如有 system prompt）
+
+□ 4. Batch Size 调优
+     增大 batch → 提升吞吐
+     监控 GPU 利用率和延迟
+
+□ 5. TP 配置
+     模型放不下单卡 → TP
+     确保 NVLink 互联（不要跨节点 TP）
+
+□ 6. Speculative Decoding
+     延迟敏感场景
+     找一个合适的 draft 模型
+
+□ 7. Kernel Fusion / 编译优化
+     torch.compile 或换 TRT-LLM
+
+□ 8. 分离式架构
+     超大规模场景
+     长短请求混合严重时
+</code></pre></div>
+
+<h2 id="5-推荐学习资源">5. 推荐学习资源</h2>
+<h3 id="51-必读论文">5.1 必读论文</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>论文</th>
+<th>关键贡献</th>
+<th>阅读优先级</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Efficient Inference for LLM (Fudan 2024 survey)</td>
+<td>推理优化全景综述</td>
+<td>⭐⭐⭐⭐⭐</td>
+</tr>
+<tr>
+<td>vLLM (PagedAttention)</td>
+<td>PagedAttention + 连续批处理</td>
+<td>⭐⭐⭐⭐⭐</td>
+</tr>
+<tr>
+<td>FlashAttention</td>
+<td>Tiling + Online Softmax</td>
+<td>⭐⭐⭐⭐⭐</td>
+</tr>
+<tr>
+<td>GPTQ</td>
+<td>基于Hessian的训练后量化</td>
+<td>⭐⭐⭐⭐</td>
+</tr>
+<tr>
+<td>AWQ</td>
+<td>激活感知权重量化</td>
+<td>⭐⭐⭐⭐</td>
+</tr>
+<tr>
+<td>Speculative Decoding (Leviathan et al.)</td>
+<td>投机解码原始论文</td>
+<td>⭐⭐⭐⭐</td>
+</tr>
+<tr>
+<td>Orca (Continuous Batching)</td>
+<td>迭代级调度</td>
+<td>⭐⭐⭐⭐</td>
+</tr>
+<tr>
+<td>SGLang (RadixAttention)</td>
+<td>前缀树 KV 缓存</td>
+<td>⭐⭐⭐</td>
+</tr>
+<tr>
+<td>Medusa</td>
+<td>多头投机解码</td>
+<td>⭐⭐⭐</td>
+</tr>
+<tr>
+<td>Splitwise</td>
+<td>分离式推理架构</td>
+<td>⭐⭐⭐</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="52-博客与教程">5.2 博客与教程</h3>
+<ul>
+<li><a href="https://vllm.ai/">vLLM 官方博客</a> — PagedAttention 原理解读</li>
+<li><a href="https://tridao.me/publications/flash2/flash2.pdf">FlashAttention 官方文档</a></li>
+<li><a href="https://kipp.ly/blog/">Kipply's LLM 推理博客</a> — 非常清晰的推理原理解释</li>
+<li><a href="https://github.com/gpu-mode">GPU Mode</a> — GPU 编程与优化社区</li>
+<li><a href="https://www.anyscale.com/blog">Ray Blog on LLM Serving</a> — 实战经验</li>
+</ul>
+<h3 id="53-源码阅读推荐">5.3 源码阅读推荐</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>项目</th>
+<th>阅读重点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>vLLM</td>
+<td><code>vllm/worker/</code> — 模型执行; <code>vllm/core/scheduler.py</code> — 调度; <code>vllm/attention/</code> — PagedAttention</td>
+</tr>
+<tr>
+<td>FlashAttention</td>
+<td><code>csrc/flash_attn/</code> — CUDA kernel; 注意 tiling 和 online softmax</td>
+</tr>
+<tr>
+<td>SGLang</td>
+<td><code>python/sglang/srt/layers/</code> — RadixAttention 实现</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="54-实践建议">5.4 实践建议</h3>
+<ol>
+<li><strong>先跑起来</strong>：用 vLLM 跑一个 7B 模型，感受基本流程</li>
+<li><strong>量一量</strong>：用 benchmark 工具测 TTFT、TPOT、吞吐，理解各指标</li>
+<li><strong>调一调</strong>：改变 batch_size、quantization、TP，看性能变化</li>
+<li><strong>读一读</strong>：挑一个优化方向（如 PagedAttention），读源码</li>
+<li><strong>写一写</strong>：尝试实现一个简单的 continuous batch scheduler</li>
+</ol>
+<div class="codehilite"><pre><span></span><code><span class="c1"># vLLM benchmark 示例</span>
+python<span class="w"> </span>-m<span class="w"> </span>vllm.entrypoints.openai.api_server<span class="w"> </span>--model<span class="w"> </span>meta-llama/Llama-2-7b-hf
+
+<span class="c1"># 另一个终端跑 benchmark</span>
+python<span class="w"> </span>benchmark_serving.py<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--backend<span class="w"> </span>vllm<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--model<span class="w"> </span>meta-llama/Llama-2-7b-hf<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--dataset-name<span class="w"> </span>random<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--random-input-len<span class="w"> </span><span class="m">512</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--random-output-len<span class="w"> </span><span class="m">128</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--num-prompts<span class="w"> </span><span class="m">100</span>
+</code></pre></div>
+
+<h2 id="思考题">思考题</h2>
+<ol class="quiz-list"><li>为什么 vLLM 不支持 Pipeline Parallelism？它适用于什么场景？<details class="answer"><summary>参考答案</summary><p>设计取向问题。vLLM 的核心定位是"单机多卡把吞吐做高"：PagedAttention + Continuous Batching 都是单机内的优化，TP 走 NVLink 单机内互联正好匹配。PP 的价值在跨机扩展（模型大到单机放不下），但 PP 的 stage 间串行依赖会引入流水线气泡和额外调度复杂度，与 vLLM 迭代级调度（每个 iteration 自由增删请求）的设计相冲突——iteration-level 调度假设所有计算资源步调一致，PP 的流水节拍会打破这个假设。</p>
+<p>适用场景对照：TP 适合单机内（NVLink 带宽高，AllReduce 便宜）；PP 适合跨机（通信只有 stage 边界的 hidden state，普通 IB/以太网也扛得住）。所以 vLLM 用单机 TP 覆盖大多数部署；模型大到必须跨机时（如 405B），换 TRT-LLM 这类同时支持 TP+PP 的框架。</p></details></li><li>如果你有一个 8×A100 的服务器，要部署 70B 模型，你会怎么配置？<details class="answer"><summary>参考答案</summary><p>先算账：70B FP16 权重 ≈ 140GB，单卡 A100 80GB 放不下。两条路线：</p>
+<p>路线 A（性能优先，卡是 80GB 版）：TP=2，每卡 70GB 权重 + KV Cache 空间，单机起 4 个实例；或 TP=4 起 2 个实例（KV Cache 更宽裕、batch 更大、吞吐更高，但 AllReduce 开销也更大）。</p>
+<p>路线 B（性价比优先，推荐）：AWQ/GPTQ INT4 量化 → 权重 ≈ 35GB，单卡可放，TP=1 起 8 个实例。INT4 对 70B 精度损失很小（&lt;1%）；decode 是 memory-bound，权重读取减少 4 倍，单实例 TPOT 反而比 FP16 TP=2 更好，还省掉 AllReduce。</p>
+<p>实战推荐：<strong>INT4 + TP=2 起 4 实例</strong>。单实例显存 = 35GB 权重 + ~45GB KV Cache，能开大 batch；实例间独立扩缩容，挂一个还有三个兜底。框架选 vLLM：<code>--quantization awq --tensor-parallel-size 2</code>。</p></details></li><li>从算法工程师的角度，你觉得推理优化和算法优化（如模型结构设计）有什么可以结合的地方？<details class="answer"><summary>参考答案</summary><p>开放题，几个方向：</p>
+<p>① 推理感知训练/设计：量化感知训练（QAT）让模型提前适应低比特；GQA/MQA 就是"为推理改结构"最成功的案例——训练时定好，推理白拿 4-8 倍 KV Cache 缩减。</p>
+<p>② 投机解码的 draft 协同设计：EAGLE / Medusa 在 target 模型上长出自投机的小头，draft 与 target 共享表征，接受率远高于独立小模型。</p>
+<p>③ 稀疏性联动：MoE 的 expert 路由决定显存换入换出策略（expert offloading 按路由热度缓存）；sliding window 等 sparse attention 直接缩小 KV Cache。</p>
+<p>④ 推理约束反哺算法：部署目标若是 INT4 + TP=2 + 单卡 80GB，算法侧选 d_model / n_heads / n_layers 时就该对齐硬件 sweet spot（Tensor Core 友好的维度、GQA 组数能整除 TP 度），而不是事后硬塞。</p></details></li></ol>
+
+
+<hr>
+<h2 id="学习回顾">学习回顾</h2>
+<p>恭喜你完成了整个学习路线！回顾一下你学到的核心知识：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>章节</th>
+<th>核心概念</th>
+<th>一句话总结</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1. 推理基础</td>
+<td>Prefill vs Decode</td>
+<td>推理 97% 时间在 decode，decode 是 memory-bound</td>
+</tr>
+<tr>
+<td>2. KV Cache</td>
+<td>PagedAttention, GQA</td>
+<td>显存的大头是 KV Cache，分页管理消除碎片</td>
+</tr>
+<tr>
+<td>3. 量化</td>
+<td>GPTQ, AWQ, FP8</td>
+<td>量化直接减少内存读取，是性价比最高的优化</td>
+</tr>
+<tr>
+<td>4. 并行与服务</td>
+<td>TP, PP, DP, SP/CP, EP</td>
+<td>节点内 TP、节点间 PP、副本间 DP，长上下文叠 CP，MoE 用 EP</td>
+</tr>
+<tr>
+<td>5. 进阶技术</td>
+<td>Speculative Decoding, FlashAttention</td>
+<td>用"猜+验证"突破串行瓶颈，用 tiling 减少 HBM 访问</td>
+</tr>
+<tr>
+<td>6. 框架生态</td>
+<td>vLLM, TRT-LLM, SGLang</td>
+<td>选框架看场景：通用选 vLLM，极致性能选 TRT-LLM</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>最重要的三个直觉</strong>：</p>
+<ol>
+<li>LLM 推理是 memory-bound，优化围绕"减少内存访问"展开</li>
+<li>量化、KV Cache 管理、增大 batch 是三板斧</li>
+<li>工程优化不改算法，但能决定算法能不能用上</li>
+</ol>
+<hr>
+<p><em>补充章节：<a href="07_cluster_and_infra.html">07_cluster_and_infra.md</a> —— 框架选好了，怎么部署到集群？怎么弹性伸缩？怎么省钱？</em></p><nav class="pager"><a class="pager-card" href="05_advanced_techniques.html"><span class="pager-dir">← 上一章</span><span class="pager-title">05 · 进阶优化技术</span></a><a class="pager-card pager-next" href="07_cluster_and_infra.html"><span class="pager-dir">下一章 →</span><span class="pager-title">07 · 推理集群与基础设施</span></a></nav>
+  </article>
+  <aside class="toc"><div class="toc-title">本页目录</div><ul class="toc-list"><li class="toc-l1"><a href="#第六章推理框架生态-生产环境用什么" data-toc-link>第六章：推理框架生态 —— 生产环境用什么？</a><ul class="toc-list"><li class="toc-l2"><a href="#1-框架全景" data-toc-link>1. 框架全景</a></li><li class="toc-l2"><a href="#2-主流框架对比" data-toc-link>2. 主流框架对比</a><ul class="toc-list"><li class="toc-l3"><a href="#21-vllm" data-toc-link>2.1 vLLM</a></li><li class="toc-l3"><a href="#22-tensorrt-llmnvidia" data-toc-link>2.2 TensorRT-LLM（NVIDIA）</a></li><li class="toc-l3"><a href="#23-sglang" data-toc-link>2.3 SGLang</a></li><li class="toc-l3"><a href="#24-tgihuggingface-text-generation-inference" data-toc-link>2.4 TGI（HuggingFace Text Generation Inference）</a></li><li class="toc-l3"><a href="#25-lmdeploy" data-toc-link>2.5 LMDeploy</a></li></ul></li><li class="toc-l2"><a href="#3-框架选型决策树" data-toc-link>3. 框架选型决策树</a></li><li class="toc-l2"><a href="#4-推理性能优化-checklist" data-toc-link>4. 推理性能优化 Checklist</a></li><li class="toc-l2"><a href="#5-推荐学习资源" data-toc-link>5. 推荐学习资源</a><ul class="toc-list"><li class="toc-l3"><a href="#51-必读论文" data-toc-link>5.1 必读论文</a></li><li class="toc-l3"><a href="#52-博客与教程" data-toc-link>5.2 博客与教程</a></li><li class="toc-l3"><a href="#53-源码阅读推荐" data-toc-link>5.3 源码阅读推荐</a></li><li class="toc-l3"><a href="#54-实践建议" data-toc-link>5.4 实践建议</a></li></ul></li><li class="toc-l2"><a href="#思考题" data-toc-link>思考题</a></li><li class="toc-l2"><a href="#学习回顾" data-toc-link>学习回顾</a></li></ul></li></ul></aside>
+</main>
+<script src="../assets/blog.js?v=1788185626"></script>
+</body>
+</html>

@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>PagedAttention：像操作系统一样管理显存</title>
+<meta name="hyperframes:composition" content="paged-attention">
+<meta name="hyperframes:width" content="1280">
+<meta name="hyperframes:height" content="720">
+<meta name="hyperframes:duration" content="14">
+<meta name="hyperframes:fps" content="30">
+<link rel="stylesheet" href="anim.css">
+<style>
+  .zone { position: absolute; top: 106px; height: 378px; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; }
+  #zone-logical { left: 40px; width: 400px; }
+  #zone-table { left: 460px; width: 280px; }
+  #zone-pool { left: 760px; width: 480px; }
+  .zone-title { position: absolute; top: 13px; left: 16px; font-size: 13.5px; font-weight: 650; }
+  .req-lbl { position: absolute; font-family: var(--mono); font-size: 13px; font-weight: 600; color: var(--ink2); }
+  .blk { position: absolute; width: 76px; height: 40px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-family: var(--mono); font-size: 12.5px; font-weight: 600; border: 1.5px solid; background: #fff; }
+  .blk-a { color: #1d4ed8; border-color: #93c5fd; background: var(--blue-bg); }
+  .blk-b { color: #b45309; border-color: #fcd34d; background: var(--amber-bg); }
+  .blk-c { color: #6d28d9; border-color: #c4b5fd; background: var(--violet-bg); }
+  .flyer { z-index: 6; box-shadow: 0 4px 14px rgba(0,0,0,.18); opacity: 0; }
+  .slot { position: absolute; width: 96px; height: 52px; border: 1.5px dashed #d4d4d8; border-radius: 9px; background: #fff; }
+  .slot-fill { border-style: solid; }
+  .map-row { position: absolute; font-family: var(--mono); font-size: 12.5px; color: var(--mut); left: 20px; }
+  .map-row b { color: var(--ink); font-weight: 600; }
+  .waste-lbl { position: absolute; font-size: 13px; color: var(--ink2); }
+  .waste-val { position: absolute; font-family: var(--mono); font-size: 14px; font-weight: 650; }
+  #b1-logical, #b1-map { opacity: 0; }
+</style>
+</head>
+<body>
+<div id="root" data-composition-id="paged-attention" data-start="0" data-duration="14" data-width="1280" data-height="720">
+  <header class="hf-head">
+    <div class="hf-head-text">
+      <span class="hf-kicker">Chapter 02 · KV Cache 与内存优化</span>
+      <h1 class="hf-title">PagedAttention：像操作系统管理内存一样管理 KV Cache</h1>
+    </div>
+    <span class="hf-chapter">04 / 12</span>
+  </header>
+
+  <div id="scene">
+    <div class="zone" id="zone-logical">
+      <span class="zone-title">逻辑视图 · 每个请求的 KV（1 块 = 4 tokens）</span>
+      <span class="req-lbl" style="left:16px;top:64px;">请求 A</span>
+      <div class="blk blk-a" id="la0" style="left:76px;top:52px;">A0</div>
+      <div class="blk blk-a" id="la1" style="left:162px;top:52px;">A1</div>
+      <div class="blk blk-a" id="la2" style="left:248px;top:52px;">A2</div>
+      <span class="req-lbl" style="left:16px;top:176px;">请求 B</span>
+      <div class="blk blk-b" id="lb0" style="left:76px;top:164px;">B0</div>
+      <div class="blk blk-b" id="b1-logical" style="left:162px;top:164px;">B1</div>
+      <span class="req-lbl" style="left:16px;top:288px;">请求 C</span>
+      <div class="blk blk-c" id="lc0" style="left:76px;top:276px;">C0</div>
+      <div class="blk blk-c" id="lc1" style="left:162px;top:276px;">C1</div>
+    </div>
+
+    <div class="zone" id="zone-table">
+      <span class="zone-title">Block Table · 页表</span>
+      <span class="map-row" style="top:56px;">A0 → <b id="m-a0">?</b></span>
+      <span class="map-row" style="top:86px;">A1 → <b id="m-a1">?</b></span>
+      <span class="map-row" style="top:116px;">A2 → <b id="m-a2">?</b></span>
+      <span class="map-row" style="top:158px;">B0 → <b id="m-b0">?</b></span>
+      <span class="map-row" style="top:188px;" id="b1-map">B1 → <b id="m-b1">?</b></span>
+      <span class="map-row" style="top:230px;">C0 → <b id="m-c0">?</b></span>
+      <span class="map-row" style="top:260px;">C1 → <b id="m-c1">?</b></span>
+      <span class="note" style="left:20px;top:308px;width:240px;">逻辑上连续，物理上可以分散 —— 查表间接寻址</span>
+    </div>
+
+    <div class="zone" id="zone-pool">
+      <span class="zone-title">物理 Block 池 · 全部请求共享</span>
+    </div>
+
+    <!-- 飞行块：从逻辑位置飞往物理池 -->
+    <div class="blk blk-a flyer" id="f-a0" style="left:116px;top:158px;">A0</div>
+    <div class="blk blk-a flyer" id="f-a1" style="left:202px;top:158px;">A1</div>
+    <div class="blk blk-b flyer" id="f-b0" style="left:116px;top:270px;">B0</div>
+    <div class="blk blk-c flyer" id="f-c0" style="left:116px;top:382px;">C0</div>
+    <div class="blk blk-a flyer" id="f-a2" style="left:288px;top:158px;">A2</div>
+    <div class="blk blk-c flyer" id="f-c1" style="left:202px;top:382px;">C1</div>
+    <div class="blk blk-b flyer" id="f-b1" style="left:202px;top:270px;">B1</div>
+
+    <div id="waste-compare" style="opacity:0;">
+      <span class="waste-lbl" style="left:40px;top:512px;">连续预分配（按最大长度预留）</span>
+      <div class="bar-track" style="left:40px;top:536px;width:700px;height:18px;"><div class="bar-fill bar-red" id="waste-old"></div></div>
+      <span class="waste-val" style="left:750px;top:533px;color:var(--red);" id="waste-old-val">浪费 60–80%</span>
+      <span class="waste-lbl" style="left:40px;top:572px;">PagedAttention（按需分配）</span>
+      <div class="bar-track" style="left:40px;top:596px;width:700px;height:18px;"><div class="bar-fill bar-green" id="waste-new"></div></div>
+      <span class="waste-val" style="left:750px;top:593px;color:var(--green);" id="waste-new-val">浪费 &lt;4%</span>
+      <span class="note" style="left:920px;top:540px;width:320px;">vLLM 论文：同等显存下吞吐提升 2–4×</span>
+    </div>
+  </div>
+
+  <footer class="hf-caption"><span class="cap-dot"></span><span id="cap-text"></span></footer>
+</div>
+<script src="gsap.min.js"></script>
+<script>
+(function () {
+  var tl = gsap.timeline({ paused: true, defaults: { ease: "power2.inOut" } });
+  var cap = function (t, text) { tl.set("#cap-text", { textContent: text }, t); };
+
+  // 物理池 12 个 slot（JS 生成，静态定位）
+  var pool = document.getElementById("zone-pool");
+  var slots = [];
+  for (var i = 0; i < 12; i++) {
+    var s = document.createElement("div");
+    s.className = "slot";
+    s.id = "slot-" + i;
+    s.style.left = 20 + (i % 4) * 108 + "px";
+    s.style.top = 50 + Math.floor(i / 4) * 64 + "px";
+    pool.appendChild(s);
+    slots.push(s);
+  }
+  // slot 在 scene 中的绝对坐标（zone-pool 位于 left:760 top:106）
+  function slotPos(i) {
+    return { x: 760 + 20 + (i % 4) * 108 + 10, y: 106 + 50 + Math.floor(i / 4) * 64 + 6 };
+  }
+
+  cap(0, "KV Cache 切成固定大小的 Block —— 借鉴操作系统虚拟内存的分页思想");
+  tl.fromTo("#zone-logical, #zone-pool, #zone-table", { autoAlpha: 0, y: 16 }, { autoAlpha: 1, y: 0, duration: 0.5, stagger: 0.15 }, 0.2);
+
+  var flights = [
+    { f: "#f-a0", slot: 0, map: "#m-a0", t: 2.2 },
+    { f: "#f-a1", slot: 1, map: "#m-a1", t: 2.9 },
+    { f: "#f-b0", slot: 2, map: "#m-b0", t: 3.6 },
+    { f: "#f-c0", slot: 3, map: "#m-c0", t: 4.3 },
+    { f: "#f-a2", slot: 4, map: "#m-a2", t: 5.0 },
+    { f: "#f-c1", slot: 5, map: "#m-c1", t: 5.7 }
+  ];
+  cap(2.2, "Block Table 记录「逻辑块 → 物理块」的映射 —— 物理位置无需连续");
+  flights.forEach(function (fl) {
+    var p = slotPos(fl.slot);
+    var el = document.querySelector(fl.f);
+    var dx = p.x - parseFloat(el.style.left);
+    var dy = p.y - parseFloat(el.style.top);
+    tl.fromTo(fl.f, { autoAlpha: 0 }, { autoAlpha: 1, duration: 0.15 }, fl.t);
+    tl.to(fl.f, { x: dx, y: dy, duration: 0.55, ease: "power2.inOut" }, fl.t + 0.05);
+    tl.set(fl.map, { textContent: "slot " + fl.slot }, fl.t + 0.6);
+    tl.set("#slot-" + fl.slot, { borderStyle: "solid", borderColor: "#a1a1aa" }, fl.t + 0.6);
+    tl.to(fl.f, { boxShadow: "none", duration: 0.2 }, fl.t + 0.6);
+  });
+  cap(6.8, "按需分配：用多少占多少，空闲 slot 可以服务其他请求");
+
+  // 浪费对比
+  cap(8.0, "对比：按最大长度预分配浪费 60–80%，PagedAttention 浪费不到 4%");
+  tl.to("#waste-compare", { opacity: 1, duration: 0.4 }, 8.0);
+  tl.to("#waste-old", { width: "76%", duration: 0.9, ease: "power2.out" }, 8.3);
+  tl.to("#waste-new", { width: "4%", duration: 0.9, ease: "power2.out" }, 9.4);
+
+  // B 生成变长，按需申请新块
+  cap(10.8, "请求变长时：用满一块，才从池里申请下一块 —— 几乎零碎片");
+  tl.to("#b1-logical", { autoAlpha: 1, duration: 0.3 }, 10.8);
+  tl.to("#b1-map", { autoAlpha: 1, duration: 0.3 }, 10.8);
+  var p6 = slotPos(6);
+  var b1 = document.querySelector("#f-b1");
+  tl.fromTo("#f-b1", { autoAlpha: 0 }, { autoAlpha: 1, duration: 0.15 }, 11.3);
+  tl.to("#f-b1", { x: p6.x - parseFloat(b1.style.left), y: p6.y - parseFloat(b1.style.top), duration: 0.55 }, 11.4);
+  tl.set("#m-b1", { textContent: "slot 6" }, 12.0);
+  tl.set("#slot-6", { borderStyle: "solid", borderColor: "#a1a1aa" }, 12.0);
+  tl.to("#f-b1", { boxShadow: "none", duration: 0.2 }, 12.0);
+  cap(12.6, "碎片 <4% + 自定义 kernel 按块寻址 = vLLM 高吞吐的核心");
+  tl.to("#scene", { autoAlpha: 0, duration: 0.5 }, 13.4);
+
+  window.__timelines = window.__timelines || {};
+  window.__timelines["paged-attention"] = tl;
+  if (new URLSearchParams(location.search).has("autoplay")) { tl.repeat(-1).play(); }
+})();
+</script>
+</body>
+</html>

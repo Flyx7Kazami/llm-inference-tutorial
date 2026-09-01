@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Roofline 模型：算术强度决定瓶颈</title>
+<meta name="hyperframes:composition" content="arithmetic-intensity">
+<meta name="hyperframes:width" content="1280">
+<meta name="hyperframes:height" content="720">
+<meta name="hyperframes:duration" content="12.5">
+<meta name="hyperframes:fps" content="30">
+<link rel="stylesheet" href="anim.css">
+<style>
+  #chart { position: absolute; left: 40px; top: 100px; }
+  .dot { position: absolute; width: 18px; height: 18px; border-radius: 50%; border: 3px solid #fff; box-shadow: 0 1px 6px rgba(0,0,0,.25); z-index: 4; }
+  #dot-decode { background: var(--red); left: 316px; top: 567px; }
+  #dot-prefill { background: var(--blue); left: 790px; top: 245px; opacity: 0; }
+  .dot-label { position: absolute; font-size: 12.5px; font-weight: 600; white-space: nowrap; z-index: 4; }
+  #lbl-decode { left: 246px; top: 592px; color: var(--red); }
+  #lbl-prefill { left: 662px; top: 222px; color: var(--blue); opacity: 0; }
+  #ridge-lbl { position: absolute; left: 720px; top: 238px; font-family: var(--mono); font-size: 12px; color: var(--ink2); opacity: 0; white-space: nowrap; }
+  #side { position: absolute; left: 1010px; top: 106px; width: 230px; display: flex; flex-direction: column; gap: 12px; }
+  .side-card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 13px 15px; }
+  .side-card .formula-line { font-family: var(--mono); font-size: 13px; color: var(--ink); line-height: 1.6; }
+  .readout-row { display: flex; justify-content: space-between; align-items: center; font-size: 12.5px; color: var(--mut); padding: 3px 0; }
+  .readout-row b { font-family: var(--mono); font-size: 13.5px; color: var(--ink); font-weight: 600; }
+  #ro-bottleneck { font-weight: 650; }
+</style>
+</head>
+<body>
+<div id="root" data-composition-id="arithmetic-intensity" data-start="0" data-duration="12.5" data-width="1280" data-height="720">
+  <header class="hf-head">
+    <div class="hf-head-text">
+      <span class="hf-kicker">Chapter 01 · 推理基础</span>
+      <h1 class="hf-title">Roofline 模型：算术强度决定瓶颈</h1>
+    </div>
+    <span class="hf-chapter">02 / 12</span>
+  </header>
+
+  <div id="scene">
+    <svg id="chart" width="950" height="560" viewBox="0 0 950 560">
+      <!-- 背景分区：x 110..669 memory-bound, 669..920 compute-bound; y 40..520 -->
+      <rect id="zone-mem" x="110" y="40" width="559" height="480" fill="#d97706" opacity="0.055"/>
+      <rect id="zone-comp" x="669" y="40" width="251" height="480" fill="#2563eb" opacity="0.05"/>
+      <!-- 网格与坐标轴 -->
+      <g id="axes" stroke="#e4e4e7" stroke-width="1">
+        <line x1="110" y1="520" x2="920" y2="520" stroke="#a1a1aa" stroke-width="1.5"/>
+        <line x1="110" y1="40" x2="110" y2="520" stroke="#a1a1aa" stroke-width="1.5"/>
+        <line x1="285" y1="520" x2="285" y2="40" stroke-dasharray="3 5"/>
+        <line x1="460" y1="520" x2="460" y2="40" stroke-dasharray="3 5"/>
+        <line x1="635" y1="520" x2="635" y2="40" stroke-dasharray="3 5"/>
+        <line x1="810" y1="520" x2="810" y2="40" stroke-dasharray="3 5"/>
+        <line x1="110" y1="373" x2="920" y2="373" stroke-dasharray="3 5"/>
+        <line x1="110" y1="227" x2="920" y2="227" stroke-dasharray="3 5"/>
+      </g>
+      <g id="ticks" font-family="ui-monospace, Menlo, monospace" font-size="12" fill="#a1a1aa">
+        <text x="110" y="540" text-anchor="middle">0.1</text>
+        <text x="285" y="540" text-anchor="middle">1</text>
+        <text x="460" y="540" text-anchor="middle">10</text>
+        <text x="635" y="540" text-anchor="middle">100</text>
+        <text x="810" y="540" text-anchor="middle">1000</text>
+        <text x="100" y="524" text-anchor="end">1</text>
+        <text x="100" y="377" text-anchor="end">10</text>
+        <text x="100" y="231" text-anchor="end">100</text>
+        <text x="515" y="556" text-anchor="middle" fill="#71717a" font-size="13">算术强度 AI（FLOP / byte）→</text>
+        <text x="26" y="280" text-anchor="middle" fill="#71717a" font-size="13" transform="rotate(-90 26 280)">可达性能（TFLOPS）→</text>
+      </g>
+      <text id="zone-mem-lbl" x="350" y="66" text-anchor="middle" font-size="12.5" fill="#d97706" font-weight="600" opacity="0">MEMORY-BOUND · 带宽墙</text>
+      <text id="zone-comp-lbl" x="795" y="66" text-anchor="middle" font-size="12.5" fill="#2563eb" font-weight="600" opacity="0">COMPUTE-BOUND · 算力墙</text>
+      <!-- Roofline：P = min(2 * AI, 312)，ridge 在 (156, 312) -->
+      <path id="roof" d="M 232 520 L 669 154 L 920 154" fill="none" stroke="#18181b" stroke-width="3" stroke-linecap="round"/>
+      <line id="ridge-line" x1="669" y1="154" x2="669" y2="520" stroke="#71717a" stroke-width="1.2" stroke-dasharray="4 4" opacity="0"/>
+      <circle id="ridge-dot" cx="669" cy="154" r="5" fill="#18181b" opacity="0"/>
+    </svg>
+
+    <div class="dot" id="dot-decode"></div>
+    <div class="dot-label" id="lbl-decode">Decode · batch=1</div>
+    <div class="dot" id="dot-prefill"></div>
+    <div class="dot-label" id="lbl-prefill">Prefill · 512 tokens</div>
+    <div id="ridge-lbl">平衡点 = 312 TFLOPS ÷ 2 TB/s<br>= 156 FLOP/byte</div>
+
+    <div id="side">
+      <div class="side-card">
+        <div class="formula-line">AI = FLOPs ÷ 访存字节数</div>
+        <div class="formula-line" style="color:var(--mut);font-size:12px;margin-top:4px;">P = min(带宽 × AI, 峰值算力)</div>
+      </div>
+      <div class="side-card" id="readout">
+        <div class="readout-row"><span>batch</span><b id="ro-batch">1</b></div>
+        <div class="readout-row"><span>算术强度</span><b id="ro-ai">1</b></div>
+        <div class="readout-row"><span>可达性能</span><b id="ro-perf">2 TFLOPS</b></div>
+        <div class="readout-row"><span>瓶颈</span><b id="ro-bottleneck" style="color:var(--amber);">显存带宽</b></div>
+      </div>
+    </div>
+  </div>
+
+  <footer class="hf-caption"><span class="cap-dot"></span><span id="cap-text"></span></footer>
+</div>
+<script src="gsap.min.js"></script>
+<script>
+(function () {
+  var tl = gsap.timeline({ paused: true, defaults: { ease: "power2.inOut" } });
+  var cap = function (t, text) { tl.set("#cap-text", { textContent: text }, t); };
+
+  var roof = document.getElementById("roof");
+  var L = roof.getTotalLength();
+  gsap.set(roof, { strokeDasharray: L, strokeDashoffset: L });
+
+  cap(0, "GPU 有两堵墙：峰值算力（312 TFLOPS）和显存带宽（2 TB/s）");
+  tl.fromTo("#axes, #ticks", { autoAlpha: 0 }, { autoAlpha: 1, duration: 0.5 }, 0.2);
+  tl.fromTo("#zone-mem-lbl, #zone-comp-lbl", { autoAlpha: 0 }, { autoAlpha: 1, duration: 0.5 }, 0.6);
+  tl.to(roof, { strokeDashoffset: 0, duration: 1.3, ease: "power1.inOut" }, 1.0);
+  tl.fromTo("#ridge-dot, #ridge-line, #ridge-lbl", { autoAlpha: 0 }, { autoAlpha: 1, duration: 0.4 }, 2.2);
+  cap(2.4, "Roofline：实际性能 = min(带宽 × 算术强度, 峰值算力)，两墙相交于平衡点 156");
+
+  // Decode 工作点
+  cap(3.2, "Decode：每算 1 个 token（≈2×7B FLOPs）要读全部权重（14GB）→ AI ≈ 1");
+  tl.fromTo("#dot-decode, #lbl-decode", { autoAlpha: 0, scale: 0.4 }, { autoAlpha: 1, scale: 1, duration: 0.45, ease: "back.out(2.2)" }, 3.2);
+  tl.to("#dot-decode", { scale: 1.35, duration: 0.5, yoyo: true, repeat: 3 }, 3.8);
+  cap(5.0, "AI ≈ 1 ≪ 156 → 只能摸到 2 TFLOPS，是峰值算力的 0.6%，卡在带宽墙上");
+
+  // Prefill 工作点
+  cap(6.6, "Prefill：512 个 token 摊薄同一份权重读取，AI 冲到数百 → 顶住算力墙");
+  tl.fromTo("#dot-prefill, #lbl-prefill", { autoAlpha: 0, scale: 0.4 }, { autoAlpha: 1, scale: 1, duration: 0.45, ease: "back.out(2.2)" }, 6.6);
+
+  // batch 扫描：Decode 点沿斜率右移
+  cap(8.4, "增大 batch：b 个请求共享一次权重读取 → AI × b，工作点沿斜线右移");
+  var sweep = [
+    { b: 1, ai: "1", perf: "2 TFLOPS", x: 0, y: 0 },
+    { b: 8, ai: "8", perf: "16 TFLOPS", x: 158, y: -133 },
+    { b: 32, ai: "32", perf: "64 TFLOPS", x: 263, y: -221 },
+    { b: 64, ai: "64", perf: "128 TFLOPS", x: 316, y: -265 }
+  ];
+  var bt = 8.6;
+  for (var i = 1; i < sweep.length; i++) {
+    (function (s, t) {
+      tl.to("#dot-decode", { x: s.x, y: s.y, duration: 0.7 }, t);
+      tl.set("#ro-batch", { textContent: String(s.b) }, t + 0.35);
+      tl.set("#ro-ai", { textContent: s.ai }, t + 0.35);
+      tl.set("#ro-perf", { textContent: s.perf }, t + 0.35);
+      tl.set("#lbl-decode", { textContent: "Decode · batch=" + s.b, x: s.x, y: s.y }, t);
+    })(sweep[i], bt + i * 0.8);
+  }
+  cap(11.0, "所以增大 batch 是 Decode 最重要的免费午餐：吞吐 ↑，直到撞上算力墙");
+  tl.to("#scene", { autoAlpha: 0, duration: 0.5 }, 12.0);
+
+  window.__timelines = window.__timelines || {};
+  window.__timelines["arithmetic-intensity"] = tl;
+  if (new URLSearchParams(location.search).has("autoplay")) { tl.repeat(-1).play(); }
+})();
+</script>
+</body>
+</html>

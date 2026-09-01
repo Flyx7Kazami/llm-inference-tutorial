@@ -1,0 +1,783 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04 · 并行与服务架构 · LLM 推理优化</title>
+<meta name="description" content="TP / PP / DP / SP / CP / EP 六种并行、调度器设计、Prefill-Decode 分离架构与资源配比。">
+<link rel="stylesheet" href="../assets/blog.css?v=1788185626">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2318181b'/%3E%3Ctext x='16' y='22' font-family='Menlo,monospace' font-size='17' font-weight='600' fill='%23fafafa' text-anchor='middle'%3E%CE%BB%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<header class="site-header">
+  <div class="container header-inner">
+    <a class="brand" href="../index.html">
+      <span class="brand-mark">λ</span>
+      <span class="brand-name">LLM 推理优化</span>
+    </a>
+    <nav class="site-nav"><a href="../chapters/01_inference_fundamentals.html" title="第 01 章">01</a><a href="../chapters/02_kv_cache_and_memory.html" title="第 02 章">02</a><a href="../chapters/03_quantization.html" title="第 03 章">03</a><a href="../chapters/04_parallelism_and_serving.html" title="第 04 章">04</a><a href="../chapters/05_advanced_techniques.html" title="第 05 章">05</a><a href="../chapters/06_framework_ecosystem.html" title="第 06 章">06</a><a href="../chapters/07_cluster_and_infra.html" title="第 07 章">07</a></nav>
+    <details class="mobile-nav">
+      <summary>章节</summary>
+      <div class="mobile-nav-panel"><a href="../chapters/01_inference_fundamentals.html" title="第 01 章">01</a><a href="../chapters/02_kv_cache_and_memory.html" title="第 02 章">02</a><a href="../chapters/03_quantization.html" title="第 03 章">03</a><a href="../chapters/04_parallelism_and_serving.html" title="第 04 章">04</a><a href="../chapters/05_advanced_techniques.html" title="第 05 章">05</a><a href="../chapters/06_framework_ecosystem.html" title="第 06 章">06</a><a href="../chapters/07_cluster_and_infra.html" title="第 07 章">07</a></div>
+    </details>
+  </div>
+</header>
+<main class="container main-grid">
+  <article class="prose">
+<div class="chapter-head"><div class="breadcrumb"><a href="../index.html">首页</a><span class="sep">/</span>第 04 章</div></div><h1 id="第四章并行与服务架构-大模型怎么切怎么服务">第四章：并行与服务架构 —— 大模型怎么切、怎么服务？</h1>
+<h2 id="1-为什么需要并行">1. 为什么需要并行？</h2>
+<p>一个 70B FP16 模型需要 ~140GB 显存，而 A100 只有 80GB → <strong>单卡放不下</strong>。</p>
+<p>即使放得下（如 7B 模型），单卡的算力和带宽也有限 → <strong>吞吐不够</strong>。</p>
+<p>所以我们需要：</p>
+<ul>
+<li><strong>模型并行</strong>：把一个大模型拆到多张卡上</li>
+<li><strong>数据并行</strong>：多个副本服务不同请求（提升吞吐）</li>
+</ul>
+<h2 id="2-模型并行">2. 模型并行</h2>
+<h3 id="21-tensor-parallelismtp张量并行">2.1 Tensor Parallelism（TP，张量并行）</h3>
+<figure class="anim-figure"><figcaption><span class="anim-badge"><svg viewBox="0 0 24 24" fill="currentColor" width="11" height="11"><path d="M8 5.5v13l11-6.5z"/></svg>动画演示</span><span class="anim-title">Tensor Parallelism：切开矩阵乘法</span><a class="anim-open" href="../animations/tensor-parallelism/index.html?autoplay=1" target="_blank" rel="noopener">新窗口打开<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="11" height="11"><path d="M7 17L17 7M9 7h8v8"/></svg></a></figcaption><div class="anim-embed"><iframe src="../animations/tensor-parallelism/index.html?autoplay=1" title="Tensor Parallelism：切开矩阵乘法" loading="lazy" scrolling="no"></iframe></div><p class="anim-caption">按列切分权重到多卡各自计算，再按行切分时用 All-Reduce 求和；每层两次 All-Reduce 是 TP 的通信税。</p></figure>
+<p><strong>核心思想</strong>：把一个大的矩阵乘法拆到多张卡上并行计算。</p>
+<p>以 Y = XW 为例，W 是 [d, d] 的权重矩阵：</p>
+<div class="dg">
+  <div class="dg-flow">
+    <div class="dg-node">
+      <div class="t">列切分（Column Parallel）</div>
+      <div class="l">W = [<span class="mono">W₁ | W₂</span>] 按列切两半</div>
+      <div class="dg-lanes" style="min-width:0;margin-top:10px">
+        <div class="dg-row"><span class="dg-lab">卡 1</span><span class="dg-cells"><i class="c-blue">Y₁ = X × W₁</i><i class="c-idle">batch, d/2</i></span></div>
+        <div class="dg-row"><span class="dg-lab">卡 2</span><span class="dg-cells"><i class="c-violet">Y₂ = X × W₂</i><i class="c-idle">batch, d/2</i></span></div>
+        <div class="dg-row"><span class="dg-lab">合并</span><span class="dg-cells"><i class="c-green">Y = [Y₁ | Y₂]</i><i class="c-idle">拼接，免通信</i></span></div>
+      </div>
+    </div>
+    <div class="dg-node">
+      <div class="t">行切分（Row Parallel）</div>
+      <div class="l">W = [<span class="mono">W₁ / W₂</span>] 按行切两半，X 也对应切开</div>
+      <div class="dg-lanes" style="min-width:0;margin-top:10px">
+        <div class="dg-row"><span class="dg-lab">卡 1</span><span class="dg-cells"><i class="c-blue">Y₁ = X₁ × W₁</i><i class="c-idle">batch, d</i></span></div>
+        <div class="dg-row"><span class="dg-lab">卡 2</span><span class="dg-cells"><i class="c-violet">Y₂ = X₂ × W₂</i><i class="c-idle">batch, d</i></span></div>
+        <div class="dg-row"><span class="dg-lab">合并</span><span class="dg-cells"><i class="c-amber">Y = Y₁ + Y₂</i><i class="c-red">需 AllReduce</i></span></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<p><strong>在 Transformer 层中的典型切法</strong>：</p>
+<div class="codehilite"><pre><span></span><code>MLP 层：
+  gate_proj / up_proj: Column Parallel（输出各算一半）
+  down_proj: Row Parallel（输入各出一半，AllReduce 合并）
+
+Attention 层：
+  QKV proj: Column Parallel（每个 head 在不同卡上）
+  o_proj: Row Parallel（AllReduce 合并）
+</code></pre></div>
+
+<div class="dg">
+  <div class="dg-flow" style="align-items:center;flex-wrap:nowrap">
+    <div class="dg-node" style="flex:0 1 auto;min-width:60px;text-align:center"><div class="t">X</div></div>
+    <div class="dg-arrow">→</div>
+    <div class="dg-node">
+      <div class="t">卡 1</div>
+      <div class="dg-cells" style="margin:8px 0"><i class="c-blue">Q₁K₁V₁</i><i class="c-idle">head 0-15</i></div>
+      <div class="dg-cells" style="margin:8px 0"><i class="c-blue">Attn₁</i>→<i class="c-blue">o_proj₁</i></div>
+    </div>
+    <div class="dg-node">
+      <div class="t">卡 2</div>
+      <div class="dg-cells" style="margin:8px 0"><i class="c-violet">Q₂K₂V₂</i><i class="c-idle">head 16-31</i></div>
+      <div class="dg-cells" style="margin:8px 0"><i class="c-violet">Attn₂</i>→<i class="c-violet">o_proj₂</i></div>
+    </div>
+    <div class="dg-arrow">→</div>
+    <div class="dg-node" style="flex:0 1 auto;min-width:110px;text-align:center;border-color:#fecaca;background:#fffbfb">
+      <div class="t" style="color:#b91c1c">AllReduce</div>
+      <div class="l">求和合并</div>
+    </div>
+    <div class="dg-arrow">→</div>
+    <div class="dg-node" style="flex:0 1 auto;min-width:70px;text-align:center"><div class="t">output</div></div>
+  </div>
+  <div class="dg-cap">QKV 按 head 列切分（免通信），o_proj 行切分（AllReduce 合并）</div>
+</div>
+
+<p><strong>通信开销</strong>：每个 Transformer 层需要 2 次 AllReduce（Attention 后 + MLP 后），TP=2 时每次 AllReduce 传输 2×d×batch×seq_len 个元素。</p>
+<blockquote class="callout callout-warn">
+<p>⚠️ <strong>关键约束</strong>：TP 的通信量与 hidden_dim × batch 成正比。TP 度数越大，通信开销越大。通常 TP≤8，且要求 GPU 之间有高速互联（NVLink）。</p>
+</blockquote>
+<h3 id="22-pipeline-parallelismpp流水线并行">2.2 Pipeline Parallelism（PP，流水线并行）</h3>
+<p><strong>核心思想</strong>：把模型按层切到不同卡上，像流水线一样处理。</p>
+<div class="dg">
+  <div class="dg-lanes">
+    <div class="dg-row"><span class="dg-lab">层分配</span><span class="dg-cells"><i class="c-blue grow">卡0 · L0-9</i><i class="c-violet grow">卡1 · L10-19</i><i class="c-amber grow">卡2 · L20-29</i><i class="c-green grow">卡3 · L30-39</i></span></div>
+    <div class="dg-row"><span class="dg-lab">请求 A</span><span class="dg-cells"><i class="c-blue grow">卡0</i><i class="c-violet grow">卡1</i><i class="c-amber grow">卡2</i><i class="c-green grow">卡3</i></span></div>
+    <div class="dg-row"><span class="dg-lab">请求 B</span><span class="dg-cells"><i class="c-pad grow">…</i><i class="c-blue grow">卡0</i><i class="c-violet grow">卡1</i><i class="c-amber grow">卡2</i><i class="c-green grow">卡3</i></span></div>
+    <div class="dg-row"><span class="dg-lab">请求 C</span><span class="dg-cells"><i class="c-pad grow">…</i><i class="c-pad grow">…</i><i class="c-blue grow">卡0</i><i class="c-violet grow">卡1</i><i class="c-amber grow">卡2</i><i class="c-green grow">卡3</i></span></div>
+  </div>
+  <div class="dg-cap">请求像流水一样依次经过各卡；卡间只传 hidden state（batch × seq × d_model）</div>
+</div>
+
+<p><strong>问题：气泡（Bubble）</strong> —— 卡在等前一批数据时空闲</p>
+<div class="dg">
+  <div class="dg-lanes">
+    <div class="dg-row"><span class="dg-lab">时间 →</span><span class="dg-cells"><i class="c-idle grow">t0</i><i class="c-idle grow">t1</i><i class="c-idle grow">t2</i><i class="c-idle grow">t3</i><i class="c-idle grow">t4</i><i class="c-idle grow">t5</i><i class="c-idle grow">t6</i><i class="c-idle grow">t7</i></span></div>
+    <div class="dg-row"><span class="dg-lab">卡 0</span><span class="dg-cells"><i class="c-blue grow">A</i><i class="c-green grow">B</i><i class="c-amber grow">C</i><i class="c-pad grow">空</i><i class="c-blue grow">A</i><i class="c-green grow">B</i><i class="c-amber grow">C</i><i class="c-pad grow">空</i></span></div>
+    <div class="dg-row"><span class="dg-lab">卡 1</span><span class="dg-cells"><i class="c-pad grow">空</i><i class="c-blue grow">A</i><i class="c-green grow">B</i><i class="c-amber grow">C</i><i class="c-pad grow">空</i><i class="c-blue grow">A</i><i class="c-green grow">B</i><i class="c-amber grow">C</i></span></div>
+    <div class="dg-row"><span class="dg-lab">卡 2</span><span class="dg-cells"><i class="c-pad grow">空</i><i class="c-pad grow">空</i><i class="c-blue grow">A</i><i class="c-green grow">B</i><i class="c-amber grow">C</i><i class="c-pad grow">空</i><i class="c-blue grow">A</i><i class="c-green grow">B</i></span></div>
+    <div class="dg-row"><span class="dg-lab">卡 3</span><span class="dg-cells"><i class="c-pad grow">空</i><i class="c-pad grow">空</i><i class="c-pad grow">空</i><i class="c-blue grow">A</i><i class="c-green grow">B</i><i class="c-amber grow">C</i><i class="c-pad grow">空</i><i class="c-blue grow">A</i></span></div>
+  </div>
+  <div class="dg-cap">虚线"空"格就是<b>气泡</b>：流水线填充和排空阶段，下游卡只能干等</div>
+</div>
+
+<p><strong>减小气泡的方法</strong>：</p>
+<ul>
+<li><strong>Micro-batching</strong>：把一个 batch 拆成多个 micro-batch，交错执行</li>
+<li><strong>Interleaved 1F1B</strong>：更激进的调度，交替使用不同层的 chunk</li>
+</ul>
+<p><strong>PP 的通信</strong>：每层组之间只需发送 hidden state（大小 = batch × seq_len × d_model），远小于 TP 的 AllReduce。</p>
+<blockquote class="callout callout-tip">
+<p>💡 <strong>TP vs PP 怎么选？</strong>
+- 优先用 TP（通信量大但延迟低，适合节点内 NVLink 互联）
+- 模型太大、单节点放不下时用 PP（跨节点通信，带宽低但通信量小）
+- 通常组合使用：节点内 TP，节点间 PP</p>
+</blockquote>
+<h3 id="23-data-parallelismdp数据并行">2.3 Data Parallelism（DP，数据并行）</h3>
+<p><strong>核心思想</strong>：模型不切，每个副本完整部署一份，把不同请求分发到不同副本。</p>
+<div class="codehilite"><pre><span></span><code>            ┌── 副本1（GPU 0-1，TP=2）──► 请求 A、B
+负载均衡 ──►├── 副本2（GPU 2-3，TP=2）──► 请求 C
+            └── 副本3（GPU 4-5，TP=2）──► 请求 D、E
+</code></pre></div>
+
+<p>推理场景的 DP 是最"便宜"的并行：</p>
+<ul>
+<li><strong>无通信</strong>：训练里 DP 每步要 AllReduce 同步梯度；推理没有反向传播，副本之间零通信，唯一需要的是请求级负载均衡</li>
+<li><strong>线性扩展</strong>：N 个副本 ≈ N 倍吞吐</li>
+</ul>
+<p>但 DP 有两个前提：</p>
+<ol>
+<li>单副本能放下模型。放不下就先 TP/PP 凑出一个完整副本（一个副本占多张卡），再用 DP 复制——总 GPU 数 = DP × 每副本卡数</li>
+<li>显存里除了权重还要留够 KV Cache 空间。副本数翻倍，集群的 KV Cache 总容量也翻倍——这才是 DP 提升并发能力的实际来源</li>
+</ol>
+<blockquote class="callout callout-tip">
+<p>💡 <strong>直觉</strong>：TP/PP 解决"能不能跑"，DP 解决"跑多快"。生产部署的标准公式 = 先用 TP 凑出能放下模型的最小副本，再用 DP 堆副本数提吞吐。</p>
+<p>顺带一提：训练里的 FSDP / ZeRO-3（权重分片 + 用时聚合）在推理上等价于 TP，只是通信时机不同，推理框架一般直接用 TP，不单独讨论。</p>
+</blockquote>
+<h3 id="24-sequence-context-parallelismsp-cp序列并行">2.4 Sequence / Context Parallelism（SP / CP，序列并行）</h3>
+<p><strong>动机</strong>：长上下文。seq_len 变长后，显存压力从权重转向激活和 KV Cache——这部分 TP 切不掉（或切不干净）。</p>
+<p><strong>SP（Sequence Parallelism，Megatron 式）</strong>：</p>
+<p>TP 只切了 Linear 层，LayerNorm / residual 路径上的激活在每张卡上仍完整复制一份。SP 把这部分激活沿序列维度切开，每卡只存 seq_len/TP 的激活：</p>
+<div class="codehilite"><pre><span></span><code>TP 区域内（Linear）:  按权重切，各算各的
+TP 区域外（LayerNorm / residual）:  按序列切，每卡处理 seq 的一段
+交界处的通信原语替换:
+  AllReduce → AllGather + ReduceScatter（总通信量不变！）
+</code></pre></div>
+
+<p>SP 是 TP 的"省显存补丁"：通信量与纯 TP 相同，但消除了激活的重复存储。现代 TP 实现（Megatron、vLLM 的长序列场景）基本都内建 SP。</p>
+<p><strong>CP（Context Parallelism，Ring Attention）</strong>：</p>
+<p>把整个序列（含 KV Cache）切成若干块分到多卡，每卡只保存自己那段的 Q/K/V：</p>
+<div class="codehilite"><pre><span></span><code>CP=4，序列切成 4 段：
+  卡0: 持有 Q₀,K₀,V₀  →  依次从环上收到 K/V₁,₂,₃  ─┐
+  卡1: 持有 Q₁,K₁,V₁  →  依次从环上收到 K/V₂,₃,₀   │ 每收到一块 K/V，
+  卡2: 持有 Q₂,K₂,V₂  →  ...                        │ 用 FlashAttention 的
+  卡3: 持有 Q₃,K₃,V₃  →  ...                        │ 在线 softmax 增量更新
+                                                   ─┘
+  每卡 KV Cache 只占 1/4，通信（Ring P2P）与计算重叠
+</code></pre></div>
+
+<p>主要收益在<strong>超长上下文的 prefill</strong>（128K ~ 1M tokens）：单卡的 KV Cache 和注意力中间结果都放不下时，CP 几乎是唯一解。短序列不值得——Ring 通信步数随 CP 度线性增长。</p>
+<blockquote class="callout callout-warn">
+<p>⚠️ <strong>SP 和 CP 常被混为一谈</strong>：SP 切的是"TP 没覆盖到的激活"，依附于 TP 存在，随 TP 白送；CP 切的是"整个序列（含 KV Cache）"，是独立的并行维度，只有长上下文场景才需要。</p>
+</blockquote>
+<h3 id="25-expert-parallelismep专家并行">2.5 Expert Parallelism（EP，专家并行）</h3>
+<p><strong>动机</strong>：MoE 模型。DeepSeek-V3 总参数 671B、每 token 只激活 37B；Mixtral 8×7B 同理。MoE 层的 FFN 变成 E 个独立 expert，router 为每个 token 选 top-k 个。</p>
+<p><strong>核心思想</strong>：把不同 expert 放到不同卡上，token 按路由结果"快递"到对应卡计算，结果再送回来。</p>
+<div class="codehilite"><pre><span></span><code>  token ─► router ─► top-2: expert 3, expert 7
+                        │
+      AllToAll dispatch（token 发往 expert 所在的卡）
+                        │
+        卡0: expert 0-3 计算    卡1: expert 4-7 计算
+                        │
+      AllToAll combine（结果发回原卡，按路由权重加权求和）
+</code></pre></div>
+
+<p>通信原语是 <strong>AllToAll</strong>，每个 MoE 层两次（dispatch + combine），对延迟敏感。</p>
+<p><strong>为什么 MoE 不用纯 TP？</strong></p>
+<ul>
+<li>单个 expert 的 FFN 很小（几 GB 量级），TP 再切一刀收益小，每层 2 次 AllReduce 却照付</li>
+<li>MoE 的价值在于计算稀疏性：每 token 只激活 top-k 个 expert。EP 让每卡只持有部分 expert、只算被路由到自己的 token，通信从稠密 AllReduce 变成"只传被路由 token"的 AllToAll</li>
+<li>671B 这种体量，EP 天然把权重摊到几十上百张卡（EP=64 时每卡只有 ~10GB 权重）</li>
+</ul>
+<p><strong>EP 的工程挑战</strong>：</p>
+<ul>
+<li><strong>负载不均</strong>：router 的偏好让"热门 expert"所在卡过载 → DeepSeek 的 EPLB（Expert Parallel Load Balance）定期重排 expert 布局，并给热门 expert 加冗余副本</li>
+<li><strong>小 batch decode 时 AllToAll 延迟占比高</strong> → 大 EP 组需要 NVLink 域 + RDMA 配合</li>
+<li>现代主流做法：<strong>Attention 部分 TP/DP + MoE 部分 EP 的混合并行</strong>（DeepSeek 官方推理架构、SGLang/vLLM 的 wide-EP 部署均如此）；冷 expert 还可以 offload 到 CPU 内存按需加载</li>
+</ul>
+<h3 id="26-常见并行策略">2.6 常见并行策略</h3>
+<p>六种并行方式对比（它们互相正交，可叠加）：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>并行方式</th>
+<th>切什么</th>
+<th>通信原语</th>
+<th>解决什么</th>
+<th>典型约束</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>TP</td>
+<td>权重矩阵</td>
+<td>AllReduce ×2/层</td>
+<td>单卡放不下、算力不够</td>
+<td>需 NVLink，通常 ≤8</td>
+</tr>
+<tr>
+<td>PP</td>
+<td>层</td>
+<td>P2P send/recv</td>
+<td>跨机扩展</td>
+<td>流水线气泡</td>
+</tr>
+<tr>
+<td>DP</td>
+<td>请求 / 副本</td>
+<td>推理时无</td>
+<td>吞吐</td>
+<td>每副本须放全模型</td>
+</tr>
+<tr>
+<td>SP</td>
+<td>序列维度的激活</td>
+<td>AllGather + ReduceScatter</td>
+<td>长序列激活显存</td>
+<td>依附 TP，通信量与 TP 相同</td>
+</tr>
+<tr>
+<td>CP</td>
+<td>整个序列（含 KV Cache）</td>
+<td>Ring P2P（可与计算重叠）</td>
+<td>超长上下文</td>
+<td>仅长上下文值得</td>
+</tr>
+<tr>
+<td>EP</td>
+<td>MoE expert</td>
+<td>AllToAll ×2/MoE 层</td>
+<td>MoE 权重巨大</td>
+<td>负载均衡、延迟敏感</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>组合公式</strong>：<code>总 GPU 数 = DP × TP × PP</code>（长上下文再 ×CP，MoE 的 FFN 部分换成 EP）</p>
+<div class="codehilite"><pre><span></span><code>例1: 70B dense，64 卡      → TP=8 × DP=8（8 个完整副本）
+例2: 405B dense            → TP=8（节点内）× PP=16（跨节点）
+例3: DeepSeek-V3           → Attention 用 DP/TP + MoE 用 EP=64，长上下文再叠 CP
+例4: 1M token 上下文 prefill → TP=8 × CP=8
+</code></pre></div>
+
+<p>按模型和场景的快速选型：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>模型大小</th>
+<th>GPU 配置</th>
+<th>推荐策略</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>7B</td>
+<td>1×A100</td>
+<td>单卡，无需并行</td>
+</tr>
+<tr>
+<td>13B</td>
+<td>1×A100</td>
+<td>单卡 + 量化，或 TP=2</td>
+</tr>
+<tr>
+<td>70B</td>
+<td>4×A100</td>
+<td>TP=4 或 TP=2+PP=2</td>
+</tr>
+<tr>
+<td>70B</td>
+<td>8×A100</td>
+<td>TP=8 或 TP=4+PP=2</td>
+</tr>
+<tr>
+<td>175B+</td>
+<td>16+ A100</td>
+<td>TP=8 + PP=2+</td>
+</tr>
+<tr>
+<td>MoE（如 DeepSeek-V3）</td>
+<td>32+ 卡</td>
+<td>Attention DP + MoE EP，配 EPLB</td>
+</tr>
+<tr>
+<td>长上下文（128K+）</td>
+<td>任意</td>
+<td>在上述基础上叠 CP</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="3-推理服务架构">3. 推理服务架构</h2>
+<h3 id="31-一个推理服务的生命周期">3.1 一个推理服务的生命周期</h3>
+<div class="codehilite"><pre><span></span><code>用户请求
+    │
+    ▼
+API Gateway ──── 负载均衡、限流、鉴权
+    │
+    ▼
+Tokenize ──── 文本 → token IDs
+    │
+    ▼
+Scheduler ──── 请求排队、batch 组装、优先级
+    │
+    ▼
+Model Runner ──── 执行前向推理（Prefill + Decode 循环）
+    │
+    ▼
+Detokenize ──── token IDs → 文本
+    │
+    ▼
+Streaming/SSE ──── 逐 token 返回给用户
+</code></pre></div>
+
+<h3 id="32-调度器scheduler-服务的核心大脑">3.2 调度器（Scheduler）—— 服务的核心大脑</h3>
+<p>调度器决定：<strong>每个 iteration 执行哪些请求、组成多大的 batch</strong></p>
+<p>关键决策：</p>
+<ol>
+<li><strong>Prefill vs Decode 混合</strong>：一个 iteration 里同时做新请求的 prefill 和已有请求的 decode</li>
+<li><strong>Chunked Prefill</strong>：把长 prompt 的 prefill 拆成多个 chunk，避免一个长 prefill 阻塞所有 decode</li>
+<li><strong>抢占（Preemption）</strong>：显存不够时，暂停某些请求，释放 KV Cache 给更高优先级的请求</li>
+</ol>
+<div class="codehilite"><pre><span></span><code>Iteration N:
+  Prefill chunk: 请求D 的前 256 tokens
+  Decode: 请求A (token 47), 请求B (token 23), 请求C (token 81)
+
+Iteration N+1:
+  Prefill chunk: 请求D 的后 128 tokens（完成 prefill）
+  Decode: 请求A (token 48), 请求B (token 24), 请求C (token 82), 请求D (token 1)
+</code></pre></div>
+
+<h3 id="33-显存管理">3.3 显存管理</h3>
+<div class="codehilite"><pre><span></span><code>┌───────────────────────────────────────────┐
+│              GPU 显存                      │
+├───────────────────┬───────────────────────┤
+│   模型权重         │    KV Cache Pool       │
+│   (固定大小)       │    (动态分配)          │
+│                   │   ┌───┐┌───┐┌───┐     │
+│   TP 每卡存 1/TP  │   │ A ││ B ││ C │     │
+│                   │   └───┘└───┘└───┘     │
+│                   │   可用 block: ...       │
+└───────────────────┴───────────────────────┘
+
+调度器的约束：
+  新请求 prefill → 需要 KV Cache → 从 pool 分配
+  如果 pool 不够 → 等待 / 抢占 / 拒绝
+</code></pre></div>
+
+<h3 id="34-投机调度speculative-scheduling">3.4 投机调度（Speculative Scheduling）</h3>
+<p>调度器还可以做更聪明的决策：</p>
+<ul>
+<li><strong>预测</strong>下一个 iteration 会有多少新请求，提前预留显存</li>
+<li><strong>预估</strong>每个请求的输出长度，优化 batch 组成</li>
+<li>对 SLO（Service Level Objective）敏感的请求给予优先级</li>
+</ul>
+<h2 id="4-部署模式">4. 部署模式</h2>
+<h3 id="41-单机多卡">4.1 单机多卡</h3>
+<div class="dg">
+  <div class="dg-node" style="max-width:560px;margin:0 auto">
+    <div class="t">一台服务器 <span class="pill pill-blue">NVLink · TP=4</span></div>
+    <div class="dg-cells" style="margin:10px 0"><i class="c-blue">GPU0</i><i class="c-blue">GPU1</i><i class="c-blue">GPU2</i><i class="c-blue">GPU3</i></div>
+    <div class="dg-cells"><i class="c-idle grow">Layer 0-9</i><i class="c-idle grow">10-19</i><i class="c-idle grow">20-29</i><i class="c-idle grow">30-39</i></div>
+  </div>
+</div>
+
+<h3 id="42-多机多卡">4.2 多机多卡</h3>
+<div class="dg">
+  <div class="dg-flow" style="align-items:center;flex-wrap:nowrap">
+    <div class="dg-node">
+      <div class="t">Node 0 <span class="pill pill-blue">TP=4</span></div>
+      <div class="dg-cells" style="margin:8px 0"><i class="c-blue">GPU0</i><i class="c-blue">GPU1</i><i class="c-blue">GPU2</i><i class="c-blue">GPU3</i></div>
+      <div class="l">TP group 0 · <b>Layer 0-19</b></div>
+    </div>
+    <div class="dg-arrow">→<span class="lab">PP=2 · IB/RoCE</span></div>
+    <div class="dg-node">
+      <div class="t">Node 1 <span class="pill pill-violet">TP=4</span></div>
+      <div class="dg-cells" style="margin:8px 0"><i class="c-violet">GPU4</i><i class="c-violet">GPU5</i><i class="c-violet">GPU6</i><i class="c-violet">GPU7</i></div>
+      <div class="l">TP group 1 · <b>Layer 20-39</b></div>
+    </div>
+  </div>
+  <div class="dg-cap">节点内 TP（NVLink 高带宽）+ 节点间 PP（只传 hidden state，普通互联即可）</div>
+</div>
+
+<h3 id="43-分离式架构prefill-decode-disaggregation">4.3 分离式架构：Prefill-Decode Disaggregation</h3>
+<figure class="anim-figure"><figcaption><span class="anim-badge"><svg viewBox="0 0 24 24" fill="currentColor" width="11" height="11"><path d="M8 5.5v13l11-6.5z"/></svg>动画演示</span><span class="anim-title">Prefill-Decode 分离架构</span><a class="anim-open" href="../animations/pd-disaggregation/index.html?autoplay=1" target="_blank" rel="noopener">新窗口打开<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="11" height="11"><path d="M7 17L17 7M9 7h8v8"/></svg></a></figcaption><div class="anim-embed"><iframe src="../animations/pd-disaggregation/index.html?autoplay=1" title="Prefill-Decode 分离架构" loading="lazy" scrolling="no"></iframe></div><p class="anim-caption">Prefill 池（算力导向）与 Decode 池（带宽导向）分离，KV Cache 经高速互联传输，两池按 T_p : T_d 独立伸缩。</p></figure>
+<h4 id="431-为什么要分离">4.3.1 为什么要分离？</h4>
+<p>回想第一章的关键洞察：<strong>Prefill 是 compute-bound，Decode 是 memory-bound</strong>。它们对硬件的需求截然不同：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>维度</th>
+<th>Prefill 实例</th>
+<th>Decode 实例</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>瓶颈</td>
+<td>算力（FLOPS）</td>
+<td>显存带宽（HBM BW）</td>
+</tr>
+<tr>
+<td>理想 GPU</td>
+<td>H100（990 TFLOPS FP16）</td>
+<td>L40S（864 GB/s 带宽，算力适中）</td>
+</tr>
+<tr>
+<td>batch 策略</td>
+<td>小 batch 也能打满算力</td>
+<td>大 batch 才能打满带宽</td>
+</tr>
+<tr>
+<td>请求特征</td>
+<td>短时、突发、计算密集</td>
+<td>长时、稳定、访存密集</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>混部的问题</strong>：当 Prefill 和 Decode 共享同一组 GPU 时：</p>
+<div class="dg">
+  <div class="dg-lanes">
+    <div class="dg-row"><span class="dg-lab">t0 – t5</span><span class="dg-cells"><i class="c-red grow">prefill A（长 prompt，吃满算力）</i><i class="c-green">decode B</i><i class="c-green">decode C</i><i class="c-green">decode D</i></span></div>
+    <div class="dg-row"><span class="dg-lab"></span><span class="dg-note-line" style="color:#b91c1c">↑ 同一 iteration 里 B/C/D 的 decode 全部被阻塞拖慢</span></div>
+    <div class="dg-row"><span class="dg-lab">t6+</span><span class="dg-cells"><i class="c-green">decode A</i><i class="c-green">decode B</i><i class="c-green">decode C</i><i class="c-green">decode D</i></span><span class="dg-note-line">A 加入，争抢带宽更激烈</span></div>
+  </div>
+  <div class="dg-cap">结果：长 prefill 拖慢所有在途请求的 TPOT；decode 低算力需求浪费 FLOPS；prefill 与 decode 争抢同一份显存预算</div>
+</div>
+
+<p><strong>分离后</strong>：</p>
+<div class="codehilite"><pre><span></span><code>Prefill 实例专注 prefill：
+  - 全力跑 prefill，GPU 利用率接近峰值算力
+  - 不受 decode 干扰，TTFT 可预测
+
+Decode 实例专注 decode：
+  - 只做 decode，可以开大 batch 充分利用带宽
+  - 不被 prefill 打断，TPOT 稳定
+  - 可以用带宽/算力比更高的便宜卡
+</code></pre></div>
+
+<h4 id="432-资源配比怎么算">4.3.2 资源配比怎么算？</h4>
+<p>Prefill 实例和 Decode 实例的数量比不是拍脑袋的，核心公式：</p>
+<div class="codehilite"><pre><span></span><code>设：
+  T_prefill = 平均每个请求的 prefill 时间（在单个 Prefill 实例上）
+  T_decode  = 平均每个请求的 decode 总时间 = avg_output_len × TPOT
+  N_prefill = Prefill 实例数
+  N_decode  = Decode 实例数
+
+稳态条件：Prefill 吞吐 = Decode 吞吐
+
+  N_prefill / T_prefill = N_decode / T_decode
+
+→ N_prefill / N_decode = T_prefill / T_decode
+</code></pre></div>
+
+<p><strong>举例</strong>：</p>
+<div class="codehilite"><pre><span></span><code>场景：LLaMA-2-70B，avg_prompt=500 tokens，avg_output=200 tokens
+  T_prefill ≈ 80ms（在 H100 上）
+  TPOT ≈ 25ms（在 H100 上，batch=64）
+  T_decode = 200 × 25ms = 5000ms
+
+  N_prefill / N_decode = 80 / 5000 = 1:62.5
+
+→ 1 个 Prefill 实例就需要 ~63 个 Decode 实例来消化！
+</code></pre></div>
+
+<p>这个比例看起来很夸张，但合理：</p>
+<ul>
+<li>Decode 每个请求要跑几百步，而 prefill 只跑一次</li>
+<li>实际中 prefill 实例可以批量处理多个请求，比例会小一些</li>
+</ul>
+<p><strong>影响因素</strong>：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>因素</th>
+<th>Prefill 实例需求 ↑</th>
+<th>Decode 实例需求 ↑</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>prompt 变长</td>
+<td>✅（计算量 ↑）</td>
+<td></td>
+</tr>
+<tr>
+<td>输出变长</td>
+<td></td>
+<td>✅（decode 步数 ↑）</td>
+</tr>
+<tr>
+<td>请求并发 ↑</td>
+<td>✅</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>模型变大</td>
+<td>✅</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>Decode batch ↑</td>
+<td></td>
+<td>❌（单实例吞吐 ↑，总实例数 ↓）</td>
+</tr>
+</tbody>
+</table></div>
+<blockquote class="callout callout-tip">
+<p>💡 <strong>实战建议</strong>：先从混部开始，监控 prefill/decode 的时间比例。当 prefill 对 decode 的干扰显著影响 SLO 时，再考虑分离。分离后用自动扩缩容调整配比。</p>
+</blockquote>
+<h4 id="433-kv-cache-跨实例传输">4.3.3 KV Cache 跨实例传输</h4>
+<p>Prefill 实例算完 KV Cache 后，需要传输给 Decode 实例。这是 PD 分离最核心的工程挑战。</p>
+<p><strong>KV Cache 有多大？</strong></p>
+<div class="codehilite"><pre><span></span><code>单层 KV Cache 大小 = 2 × seq_len × d_model × sizeof(dtype)
+
+LLaMA-2-70B (d=8192, 80 层), prompt=500 tokens, FP16:
+  = 2 × 500 × 8192 × 2 × 80
+  = 1.31 GB
+
+LLaMA-2-70B, prompt=4000 tokens, FP16:
+  = 10.5 GB  ← 一个请求的 KV Cache 就 10GB！
+</code></pre></div>
+
+<p><strong>传输方案对比</strong>：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>方案</th>
+<th>带宽</th>
+<th>延迟</th>
+<th>实现复杂度</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>TCP/RDMA over Converged Ethernet</td>
+<td>25-100 Gbps</td>
+<td>高</td>
+<td>低</td>
+</tr>
+<tr>
+<td>InfiniBand RDMA</td>
+<td>200-400 Gbps</td>
+<td>中</td>
+<td>中</td>
+</tr>
+<tr>
+<td>GPU Direct RDMA</td>
+<td>200-400 Gbps</td>
+<td>低</td>
+<td>高</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>GPU Direct RDMA</strong>：KV Cache 直接从 Prefill GPU 的显存 → 网卡 → Decode GPU 的显存，<strong>不经 CPU 内存</strong>，减少两次拷贝和一次 CPU 参与。</p>
+<div class="dg">
+  <div class="dg-lanes" style="min-width:0">
+    <div class="dg-row" style="grid-template-columns:150px 1fr"><span class="dg-lab">普通 RDMA</span><span class="dg-cells"><i class="c-blue">Prefill GPU 显存</i>→<i class="c-red">CPU 内存</i>→<i class="c-idle">网卡</i>→<i class="c-red">CPU 内存</i>→<i class="c-green">Decode GPU 显存</i></span></div>
+    <div class="dg-row" style="grid-template-columns:150px 1fr"><span class="dg-lab"></span><span class="dg-note-line" style="color:#b91c1c">2 次 GPU↔CPU 拷贝</span></div>
+    <div class="dg-row" style="grid-template-columns:150px 1fr"><span class="dg-lab">GPU Direct RDMA</span><span class="dg-cells"><i class="c-blue">Prefill GPU 显存</i>→<i class="c-idle">网卡</i>→<i class="c-green">Decode GPU 显存</i></span></div>
+    <div class="dg-row" style="grid-template-columns:150px 1fr"><span class="dg-lab"></span><span class="dg-note-line" style="color:#047857">0 次 CPU 参与，延迟降低 40-60%</span></div>
+  </div>
+</div>
+
+<p><strong>KV Cache 传输延迟的影响</strong>：</p>
+<div class="codehilite"><pre><span></span><code>TTFT (分离式) = Prefill 计算时间 + KV Cache 传输延迟 + Decode 排队时间
+TTFT (混部)   = Prefill 计算时间 + Decode 排队时间
+
+多出来的就是 KV Cache 传输延迟。如果传输 1.3GB via IB RDMA (400 Gbps):
+  1.3GB × 8 / 400Gbps ≈ 0.26ms  ← 很小，可接受
+
+但 prompt=4000 tokens 的 10.5GB:
+  10.5GB × 8 / 400Gbps ≈ 2.1ms  ← 仍然可控
+</code></pre></div>
+
+<blockquote class="callout callout-warn">
+<p>⚠️ 关键：KV Cache 传输必须<strong>在 prefill 完成后、decode 开始前</strong>完成。如果传输延迟 &gt; 一个 decode step 的间隔，就会在 decode 侧产生空转气泡。</p>
+</blockquote>
+<h4 id="434-chunked-prefill-pd-分离">4.3.4 Chunked Prefill + PD 分离</h4>
+<p><strong>Chunked Prefill</strong>（本章 3.2 节介绍过）和 PD 分离是天然搭档：</p>
+<p>不加 Chunked Prefill 的 PD 分离：Prefill 实例必须等完整 prompt 算完才能传 KV Cache，长 prompt 导致 Prefill 实例长时间被一个请求占住。</p>
+<p>加 Chunked Prefill：把长 prompt 切成 chunk（如 512 tokens/chunk），算完一个 chunk 就传一部分 KV Cache 给 Decode 实例，Decode 可以更早开始生成：</p>
+<div class="dg">
+  <div class="dg-title">切 chunk：传输与计算重叠，Decode 提前开工</div>
+  <div class="dg-lanes">
+    <div class="dg-row"><span class="dg-lab">Prefill</span><span class="dg-cells"><i class="c-blue grow">chunk 1</i><i class="c-blue grow">chunk 2</i><i class="c-blue grow">chunk 3</i></span></div>
+    <div class="dg-row"><span class="dg-lab">KV 传输</span><span class="dg-cells"><i class="c-violet grow">KV₁</i><i class="c-violet grow">KV₂</i><i class="c-violet grow">KV₃</i></span></div>
+    <div class="dg-row"><span class="dg-lab">Decode</span><span class="dg-cells"><i class="c-pad grow">…</i><i class="c-green grow" style="flex-grow:2">开始 decode ↖ 收到 KV₁ 即可开工</i></span></div>
+  </div>
+  <div class="dg-title" style="margin-top:18px">不切 chunk：传 KV 是串行的尾巴</div>
+  <div class="dg-lanes">
+    <div class="dg-row"><span class="dg-lab">Prefill</span><span class="dg-cells"><i class="c-blue grow" style="flex-grow:3">整个 prompt</i></span></div>
+    <div class="dg-row"><span class="dg-lab">KV 传输</span><span class="dg-cells"><i class="c-pad grow" style="flex-grow:3">等待</i><i class="c-violet grow">完整 KV</i></span></div>
+    <div class="dg-row"><span class="dg-lab">Decode</span><span class="dg-cells"><i class="c-pad grow" style="flex-grow:4">…</i><i class="c-green grow">开始 decode</i></span></div>
+  </div>
+</div>
+
+<p><strong>配合的关键收益</strong>：</p>
+<ol>
+<li><strong>降低 TTFT</strong>：Decode 不用等完整 KV Cache 传完就能开始（首 token 可在第一个 chunk 传完后立即生成）</li>
+<li><strong>Prefill 实例更灵活</strong>：小 chunk 意味着更细粒度的调度，多个请求的 chunk 可以交错执行</li>
+<li><strong>传输分散</strong>：KV Cache 分批传输，避免瞬间大流量冲击网络</li>
+</ol>
+<blockquote class="callout callout-tip">
+<p>💡 注意：Chunked Prefill 下跨 chunk 的 attention 需要特殊处理（如 FlashAttention 的 incremental KV cache 更新），这在 vLLM 和 SGLang 中已有实现。</p>
+</blockquote>
+<h4 id="435-主要方案对比">4.3.5 主要方案对比</h4>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>方案</th>
+<th>核心思路</th>
+<th>KV 传输方式</th>
+<th>调度策略</th>
+<th>特点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>DistServe</strong> (2024)</td>
+<td>PD 完全分离，独立资源池</td>
+<td>GPU Direct RDMA</td>
+<td>Prefill/Decode 独立调度</td>
+<td>首个系统性的 PD 分离方案，证明了分离的 SLO 优势</td>
+</tr>
+<tr>
+<td><strong>Splitwise</strong> (2024)</td>
+<td>PD 分离 + chunked prefill</td>
+<td>IB RDMA</td>
+<td>统一调度器协调两个池</td>
+<td>微软方案，关注节点异构配比与成本优化</td>
+</tr>
+<tr>
+<td><strong>Mooncake</strong> (2024)</td>
+<td>PD 分离 + KV Cache 分离存储</td>
+<td>GPU Direct RDMA + KV Pool</td>
+<td>请求级调度 + KV Cache 预取</td>
+<td>月之暗面方案，KV Cache 可缓存复用，支持 prefix caching</td>
+</tr>
+<tr>
+<td><strong>MemServe</strong> (2024)</td>
+<td>PD 分离 + 全局内存池</td>
+<td>RDMA</td>
+<td>内存感知调度</td>
+<td>关注 KV Cache 的全局管理和复用</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>DistServe 的关键发现</strong>：</p>
+<div class="codehilite"><pre><span></span><code>实验（LLaMA-2-70B, A100 GPU）：
+  混部:  P99 TTFT = 8.2s, P99 TPOT = 120ms
+  分离:  P99 TTFT = 1.5s, P99 TPOT = 28ms
+
+  → 分离后 TTFT 降低 5.5×, TPOT 降低 4.3×
+  → SLO 达成率从 30% 提升到 99%+
+</code></pre></div>
+
+<p>为什么差距这么大？因为混部下，<strong>一个长 prompt 的 prefill 就能让所有在途请求的 decode 延迟暴涨</strong>。分离后互不干扰。</p>
+<p><strong>Mooncake 的独特创新——KV Cache 复用</strong>：</p>
+<div class="codehilite"><pre><span></span><code>传统 PD 分离:
+  每次请求的 KV Cache 用完即弃
+
+Mooncake:
+  KV Cache 存入全局 Pool（CPU 内存 / SSD）
+  → 如果新请求与旧请求有相同 prefix（如 system prompt）
+  → 直接从 Pool 加载 prefix 的 KV Cache，跳过这部分的 prefill
+
+  例：system prompt = 2000 tokens
+  - 首次请求：正常 prefill，存入 Pool
+  - 后续请求：加载 prefix KV Cache（~2ms from CPU），只需 prefill 用户输入部分
+  → TTFT 降低 50-70%
+</code></pre></div>
+
+<h4 id="436-什么场景下-pd-分离收益最大">4.3.6 什么场景下 PD 分离收益最大？</h4>
+<p><strong>收益大的场景</strong>：</p>
+<div class="codehilite"><pre><span></span><code>✅ 长 prompt（&gt;1k tokens）
+   → Prefill 耗时长，混部下对 decode 干扰大
+   → 分离后 prefill 不阻塞 decode
+
+✅ 高并发、输出长度差异大
+   → 不同请求的 decode 时间差异大，混部调度困难
+   → 分离后各自独立扩缩容
+
+✅ 对 SLO 严格（如 P99 TPOT &lt; 50ms）
+   → 混部下长 prefill 导致 TPOT 尖刺
+   → 分离后 TPOT 更稳定
+
+✅ System prompt 复用（搭配 Mooncake 式 KV 缓存）
+   → 大量请求共享 prefix，KV Cache 复用收益大
+
+✅ 大规模集群（&gt;16 GPU）
+   → 集群够大才有资源做细粒度配比
+   → 小集群分离反而增加调度开销
+</code></pre></div>
+
+<p><strong>收益有限的场景</strong>：</p>
+<div class="codehilite"><pre><span></span><code>❌ 短 prompt + 短输出（如聊天摘要）
+   → Prefill 快、decode 也短，分离开销 &gt; 收益
+
+❌ 低并发场景
+   → 混部本身没有资源争抢，分离无意义
+
+❌ 小规模部署（&lt;8 GPU）
+   → 分离后每个池的 GPU 数太少，TP/PP 度数不够，反而更慢
+
+❌ KV Cache 传输瓶颈（无高速网络）
+   → 如果只有 TCP 网络，传输延迟可能抵消分离收益
+</code></pre></div>
+
+<p><strong>决策流程</strong>：</p>
+<div class="dg dg-tree">
+  <ul>
+    <li><span class="root">有高速互联（IB/RoCE）？</span>
+      <ul>
+        <li><span class="yes">是</span> → <span class="em">高并发？&gt;100 RPM？</span>
+          <ul>
+            <li><span class="yes">是</span> → <span class="em">长 prompt（&gt;500 tokens）？</span>
+              <ul>
+                <li><span class="yes">是</span> → <b>PD 分离，收益大</b></li>
+                <li><span class="no">否</span> → 先试 chunked prefill</li>
+              </ul>
+            </li>
+            <li><span class="no">否</span> → 混部够用，不必分离</li>
+          </ul>
+        </li>
+        <li><span class="no">否</span> → 先升级网络</li>
+      </ul>
+    </li>
+  </ul>
+</div>
+
+<h2 id="思考题">思考题</h2>
+<ol class="quiz-list"><li>TP=8 时，每个 Transformer 层需要几次 AllReduce？如果 batch 大，通信占比会怎样变化？<details class="answer"><summary>参考答案</summary><p>次数与 TP 度无关：每层固定 2 次 AllReduce——Attention 的 o_proj（Row Parallel 输出合并）一次，MLP 的 down_proj 一次。TP=8 改变的是每次 AllReduce 的通信量和参与卡数（Ring AllReduce 的步数随 N 增长），不改变次数。</p>
+<p>batch 大时通信占比会上升。Decode 每步耗时 = 权重读取（固定，与 batch 无关）+ 计算（∝batch）+ 通信（∝batch）。小 batch 时权重读取占主导，通信被掩盖；batch 增大后权重读取被摊薄，通信在剩余时间里的占比越来越高，最终逼近由"计算速率 vs 互联带宽"决定的饱和值。这就是为什么 TP 必须限制在 NVLink 互联的单机之内，跨机要换 PP。</p></details></li><li>PP 的气泡问题，micro-batching 是如何缓解的？能完全消除吗？<details class="answer"><summary>参考答案</summary><p>把一个大 batch 拆成 m 个 micro-batch，让各 stage 流水起来：stage 2 处理 micro-batch 1 的同时，stage 1 处理 micro-batch 2，空闲时间被填满。气泡占比 ≈ (p-1)/(m+p-1)（p = stage 数），m 越大气泡越小。</p>
+<p>不能完全消除：① 流水的填充（warmup）和排空（drain）阶段天然存在——第一个 micro-batch 到达最后一个 stage 之前，后面的 stage 必然空闲；② m 也不能无限大：micro-batch 太小，每次前向的 kernel launch、权重读取等固定开销占比上升（decode 是 memory-bound，权重读取次数 = micro-batch 数，拆得越细读权重越频繁），通信轮次也增多。实践上 m 取 4-8，再配合 1F1B / interleaved 调度压缩显存和气泡。</p></details></li><li>分离式架构中，KV Cache 传输的延迟怎么影响 TTFT 和 TPOT？<details class="answer"><summary>参考答案</summary><p>TTFT 直接增加：Decode 实例拿到 KV Cache 之前无法开始生成，传输延迟（几十到几百 ms，取决于 KV 大小和链路）完整加在 TTFT 上。缓解办法是流水化传输——按层或按 chunk 边算边传（chunked prefill 算完一块传一块），Decode 实例收到第一批 KV 即可开工，传输被 prefill 计算掩盖。</p>
+<p>TPOT 稳态下不受影响：传输是每个请求一次性的事件，不在逐 token 的生成循环里。但有间接影响——多请求同时迁移 KV 时，如果传输与数据面共享网络，带宽争抢会给 TPOT 引入抖动（p99 变差）。所以生产部署用独立的 RDMA/IB 链路传 KV（Mooncake 的核心设计之一就是把 KV 传输放到专用高速网络上）。</p></details></li><li>如果一个 70B 模型的平均 prompt 长度是 1000 tokens，平均输出 300 tokens，Prefill 实例吞吐 20 req/s，Decode 实例 TPOT=20ms，需要多少 Decode 实例才能跟上 1 个 Prefill 实例？<details class="answer"><summary>参考答案</summary><p>套本章 4.3.2 的稳态公式 N_prefill / N_decode = T_prefill / T_decode：</p>
+<p>T_decode = 300 × 20ms = 6s，即一个请求要占 Decode 实例 6 秒 → 单 Decode 实例吞吐 = 1/6 req/s。N_decode = 20 ÷ (1/6) = <strong>120 个</strong>。</p>
+<p>120:1 看似夸张，但这正是"decode 重、prefill 轻"的直接体现（与本章 1:62.5 的例子同构）。注意这个结果隐含 Decode 实例 batch=1；实际会开 continuous batching——batch=64 且 TPOT 仍 ≈20ms 时，单实例同时服务 64 个请求，吞吐 64/6 ≈ 10.7 req/s，只需 ~2 个 Decode 实例。配比对 batch 容量假设极其敏感，这是实战中配比调整的关键变量。</p></details></li><li>Mooncake 的 KV Cache 复用在什么场景下收益最大？什么场景下几乎没有收益？<details class="answer"><summary>参考答案</summary><p>收益最大：存在长公共前缀且 prefill 占比高的场景——多轮对话（历史轮次 KV 直接复用，不再重新 prefill）、共享 system prompt / few-shot 前缀的请求、RAG 命中相同检索文档、Agent 场景反复携带的长工具描述。本质是"省掉重复的 prefill 计算"，前缀越长、复用率越高，省得越多。</p>
+<p>几乎没收益：① 单轮、短 prompt、内容互不相同的流量（没有可复用的前缀）；② decode 主导的长生成场景（prefill 占比本来就小，省了不影响整体）；③ 复用成本高于重算的场景——KV 存在远端/CPU 内存，加载时间超过本地重算 prefill 的时间时，复用反而更慢（这也是 Mooncake 要把 KV 池架在高速互联上的原因）。</p></details></li><li>DeepSeek-V3（671B 总参数、每 token 只激活 37B 的 MoE）做在线服务，为什么主流部署选 EP 而不是纯 TP？EP 最大的工程挑战是什么？<details class="answer"><summary>参考答案</summary><p>选 EP 的根本原因是 MoE 的计算稀疏性与 TP 的稠密假设冲突：</p>
+<p>① 单个 expert 的 FFN 只有几 GB，TP 把它再切一刀收益很小，但每层 2 次 AllReduce 的通信税照付——切得越碎，通信/计算比越难看。</p>
+<p>② 更本质的：每个 token 只激活 top-k 个 expert。纯 TP 下所有 expert 的权重都参与计算（或至少都参与通信），稀疏性完全浪费；EP 让每卡只持有 E/EP 个 expert，token 经 AllToAll 只流向被路由的 expert，通信量与实际计算量都正比于"激活的部分"而非"总参数"。</p>
+<p>③ 671B 的体量用 TP 摊需要极多组（TP=8 每组仍要 84GB+），EP=64 时每卡只有 ~10GB expert 权重，还能和 Attention 部分的 DP/TP 正交组合。</p>
+<p>最大工程挑战是<strong>负载不均</strong>：router 的偏好会让少数热门 expert 所在卡过载，整组进度被最慢的卡拖住（AllToAll 是同步原语）。解法是 DeepSeek 的 EPLB——定期统计路由分布、重排 expert 物理布局，并给热门 expert 加冗余副本。其次是 decode 小 batch 时 AllToAll 延迟占比高，需要大 NVLink 域 + RDMA 兜底。</p></details></li></ol>
+
+
+<hr>
+<p><em>下一章：<a href="05_advanced_techniques.html">05_advanced_techniques.md</a> —— 进阶优化：Speculative Decoding、FlashAttention、Kernel Fusion。</em></p><nav class="pager"><a class="pager-card" href="03_quantization.html"><span class="pager-dir">← 上一章</span><span class="pager-title">03 · 量化</span></a><a class="pager-card pager-next" href="05_advanced_techniques.html"><span class="pager-dir">下一章 →</span><span class="pager-title">05 · 进阶优化技术</span></a></nav>
+  </article>
+  <aside class="toc"><div class="toc-title">本页目录</div><ul class="toc-list"><li class="toc-l1"><a href="#第四章并行与服务架构-大模型怎么切怎么服务" data-toc-link>第四章：并行与服务架构 —— 大模型怎么切、怎么服务？</a><ul class="toc-list"><li class="toc-l2"><a href="#1-为什么需要并行" data-toc-link>1. 为什么需要并行？</a></li><li class="toc-l2"><a href="#2-模型并行" data-toc-link>2. 模型并行</a><ul class="toc-list"><li class="toc-l3"><a href="#21-tensor-parallelismtp张量并行" data-toc-link>2.1 Tensor Parallelism（TP，张量并行）</a></li><li class="toc-l3"><a href="#22-pipeline-parallelismpp流水线并行" data-toc-link>2.2 Pipeline Parallelism（PP，流水线并行）</a></li><li class="toc-l3"><a href="#23-data-parallelismdp数据并行" data-toc-link>2.3 Data Parallelism（DP，数据并行）</a></li><li class="toc-l3"><a href="#24-sequence-context-parallelismsp-cp序列并行" data-toc-link>2.4 Sequence / Context Parallelism（SP / CP，序列并行）</a></li><li class="toc-l3"><a href="#25-expert-parallelismep专家并行" data-toc-link>2.5 Expert Parallelism（EP，专家并行）</a></li><li class="toc-l3"><a href="#26-常见并行策略" data-toc-link>2.6 常见并行策略</a></li></ul></li><li class="toc-l2"><a href="#3-推理服务架构" data-toc-link>3. 推理服务架构</a><ul class="toc-list"><li class="toc-l3"><a href="#31-一个推理服务的生命周期" data-toc-link>3.1 一个推理服务的生命周期</a></li><li class="toc-l3"><a href="#32-调度器scheduler-服务的核心大脑" data-toc-link>3.2 调度器（Scheduler）—— 服务的核心大脑</a></li><li class="toc-l3"><a href="#33-显存管理" data-toc-link>3.3 显存管理</a></li><li class="toc-l3"><a href="#34-投机调度speculative-scheduling" data-toc-link>3.4 投机调度（Speculative Scheduling）</a></li></ul></li><li class="toc-l2"><a href="#4-部署模式" data-toc-link>4. 部署模式</a><ul class="toc-list"><li class="toc-l3"><a href="#41-单机多卡" data-toc-link>4.1 单机多卡</a></li><li class="toc-l3"><a href="#42-多机多卡" data-toc-link>4.2 多机多卡</a></li><li class="toc-l3"><a href="#43-分离式架构prefill-decode-disaggregation" data-toc-link>4.3 分离式架构：Prefill-Decode Disaggregation</a><ul class="toc-list"></ul></li></ul></li><li class="toc-l2"><a href="#思考题" data-toc-link>思考题</a></li></ul></li></ul></aside>
+</main>
+<script src="../assets/blog.js?v=1788185626"></script>
+</body>
+</html>

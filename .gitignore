@@ -1,0 +1,10 @@
+.venv-site/
+.DS_Store
+__pycache__/
+*.pyc
+animations/
+.agents/
+subagent_messages.json
+skills-lock.json
+*.md
+!README.md

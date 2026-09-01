@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LLM 推理优化学习路线 · LLM 推理优化</title>
+<meta name="description" content="从为什么慢出发，逐层拆解 LLM 推理优化：KV Cache、量化、并行、框架与集群。">
+<link rel="stylesheet" href="assets/blog.css?v=1788185626">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2318181b'/%3E%3Ctext x='16' y='22' font-family='Menlo,monospace' font-size='17' font-weight='600' fill='%23fafafa' text-anchor='middle'%3E%CE%BB%3C/text%3E%3C/svg%3E">
+</head>
+<body class="home-page">
+<header class="site-header">
+  <div class="container header-inner">
+    <a class="brand" href="index.html">
+      <span class="brand-mark">λ</span>
+      <span class="brand-name">LLM 推理优化</span>
+    </a>
+    <nav class="site-nav"><a href="chapters/01_inference_fundamentals.html" title="第 01 章">01</a><a href="chapters/02_kv_cache_and_memory.html" title="第 02 章">02</a><a href="chapters/03_quantization.html" title="第 03 章">03</a><a href="chapters/04_parallelism_and_serving.html" title="第 04 章">04</a><a href="chapters/05_advanced_techniques.html" title="第 05 章">05</a><a href="chapters/06_framework_ecosystem.html" title="第 06 章">06</a><a href="chapters/07_cluster_and_infra.html" title="第 07 章">07</a></nav>
+    <details class="mobile-nav">
+      <summary>章节</summary>
+      <div class="mobile-nav-panel"><a href="chapters/01_inference_fundamentals.html" title="第 01 章">01</a><a href="chapters/02_kv_cache_and_memory.html" title="第 02 章">02</a><a href="chapters/03_quantization.html" title="第 03 章">03</a><a href="chapters/04_parallelism_and_serving.html" title="第 04 章">04</a><a href="chapters/05_advanced_techniques.html" title="第 05 章">05</a><a href="chapters/06_framework_ecosystem.html" title="第 06 章">06</a><a href="chapters/07_cluster_and_infra.html" title="第 07 章">07</a></div>
+    </details>
+  </div>
+</header>
+<main class="container home">
+
+<section class="hero">
+  <img class="hero-img" src="assets/07908e56-e128-4457-9d02-d8fb57b41c04.jpeg" alt="LLM 推理优化封面图">
+  <div class="hero-overlay">
+    <h1>LLM 推理优化<br><span class="h1-mid">从原理到生产部署</span></h1>
+    <p class="hero-sub">从「为什么慢」出发，逐层拆解 KV Cache、量化、并行与调度，把从单卡到推理集群的核心优化手段讲透。</p>
+    <div class="hero-actions">
+      <a class="btn btn-primary" href="chapters/01_inference_fundamentals.html">从第 01 章开始</a>
+      <a class="btn btn-outline" href="#route">查看学习路线</a>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2 class="section-title">你会学到什么</h2>
+  <ul class="learn-grid"><li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="15" height="15"><path d="M20 6L9 17l-5-5"/></svg>LLM 推理的两个阶段（Prefill / Decode）及其截然不同的性能特征</li><li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="15" height="15"><path d="M20 6L9 17l-5-5"/></svg>为什么推理是 memory-bound 而非 compute-bound</li><li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="15" height="15"><path d="M20 6L9 17l-5-5"/></svg>KV Cache 的原理、痛点与优化（PagedAttention 等）</li><li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="15" height="15"><path d="M20 6L9 17l-5-5"/></svg>量化的数学原理与工程实践（GPTQ / AWQ / FP8）</li><li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="15" height="15"><path d="M20 6L9 17l-5-5"/></svg>并行策略：Tensor Parallelism / Pipeline Parallelism</li><li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="15" height="15"><path d="M20 6L9 17l-5-5"/></svg>进阶技术：Speculative Decoding / FlashAttention / Kernel Fusion</li><li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="15" height="15"><path d="M20 6L9 17l-5-5"/></svg>主流推理框架对比（vLLM / TGI / TensorRT-LLM / SGLang）</li><li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="15" height="15"><path d="M20 6L9 17l-5-5"/></svg>推理集群与基础设施：Autoscaling、负载均衡、GPU 资源管理、成本优化</li></ul>
+</section>
+
+<section id="route">
+  <h2 class="section-title">学习路线</h2>
+  <div class="chapter-grid"><a class="chapter-card" href="chapters/01_inference_fundamentals.html"><div class="card-top"><span class="card-num">01</span></div><div class="card-title">LLM 推理基础</div><div class="card-sub">推理到底慢在哪？</div><div class="card-desc">自回归生成的本质、Prefill 与 Decode 两个阶段、为什么推理是 memory-bound、关键性能指标。</div><span class="card-cta">开始阅读 →</span></a><a class="chapter-card" href="chapters/02_kv_cache_and_memory.html"><div class="card-top"><span class="card-num">02</span></div><div class="card-title">KV Cache 与内存优化</div><div class="card-sub">显存都去哪了？</div><div class="card-desc">KV Cache 的原理与显存开销、PagedAttention、Continuous Batching、MQA / GQA。</div><span class="card-cta">开始阅读 →</span></a><a class="chapter-card" href="chapters/03_quantization.html"><div class="card-top"><span class="card-num">03</span></div><div class="card-title">量化</div><div class="card-sub">精度换速度，到底怎么换？</div><div class="card-desc">均匀量化的数学、PTQ 主流方法（GPTQ / AWQ / FP8）、Weight-Only 与反量化开销。</div><span class="card-cta">开始阅读 →</span></a><a class="chapter-card" href="chapters/04_parallelism_and_serving.html"><div class="card-top"><span class="card-num">04</span></div><div class="card-title">并行与服务架构</div><div class="card-sub">大模型怎么切、怎么服务？</div><div class="card-desc">TP / PP / DP / SP / CP / EP 六种并行、调度器设计、Prefill-Decode 分离架构与资源配比。</div><span class="card-cta">开始阅读 →</span></a><a class="chapter-card" href="chapters/05_advanced_techniques.html"><div class="card-top"><span class="card-num">05</span></div><div class="card-title">进阶优化技术</div><div class="card-sub">还有哪些黑科技？</div><div class="card-desc">Speculative Decoding、FlashAttention、Kernel Fusion、Prefix Caching。</div><span class="card-cta">开始阅读 →</span></a><a class="chapter-card" href="chapters/06_framework_ecosystem.html"><div class="card-top"><span class="card-num">06</span></div><div class="card-title">推理框架生态</div><div class="card-sub">生产环境用什么？</div><div class="card-desc">vLLM / TensorRT-LLM / SGLang / TGI / LMDeploy 对比，选型决策树与学习资源。</div><span class="card-cta">开始阅读 →</span></a><a class="chapter-card" href="chapters/07_cluster_and_infra.html"><div class="card-top"><span class="card-num">07</span></div><div class="card-title">推理集群与基础设施</div><div class="card-sub">怎么把模型跑在“云”上？</div><div class="card-desc">Autoscaling、负载均衡与路由、GPU 资源管理、CPU/GPU 混合部署与成本优化。</div><span class="card-cta">开始阅读 →</span></a></div>
+</section>
+
+<section>
+  <h2 class="section-title">建议学习方式</h2>
+  <ol class="howto">
+    <li>按顺序读，每章都有「算法同学容易混淆的直觉」提示。</li>
+    <li>动画可以反复看：它们把每章最核心、最难靠文字建立的直觉做了可视化。</li>
+    <li>每章末尾有思考题，建议自己想一下再看答案。</li>
+    <li>涉及代码的地方会给出最小可运行示例（PyTorch）。</li>
+    <li>第 7 章涉及 K8s / 云服务，建议结合实际部署经验理解。</li>
+  </ol>
+</section>
+
+</main>
+<script src="assets/blog.js?v=1788185626"></script>
+</body>
+</html>

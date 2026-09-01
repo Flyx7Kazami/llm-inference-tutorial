@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Continuous Batching：迭代级调度</title>
+<meta name="hyperframes:composition" content="continuous-batching">
+<meta name="hyperframes:width" content="1280">
+<meta name="hyperframes:height" content="720">
+<meta name="hyperframes:duration" content="13">
+<meta name="hyperframes:fps" content="30">
+<link rel="stylesheet" href="anim.css">
+<style>
+  .lane { width: 1200px; height: 240px; left: 40px; }
+  #lane-static { top: 106px; }
+  #lane-cont { top: 386px; }
+  .lane-badge { position: absolute; top: 15px; right: 16px; }
+  .grid { position: absolute; left: 0; top: 0; width: 100%; height: 100%; }
+  .cell {
+    position: absolute; width: 112px; height: 38px; border-radius: 8px;
+    display: flex; align-items: center; justify-content: center;
+    font-family: var(--mono); font-size: 12px; font-weight: 600; opacity: 0;
+    border: 1.5px solid;
+  }
+  .cell-gen { background: var(--blue-bg); border-color: #93c5fd; color: #1d4ed8; }
+  .cell-idle { background: var(--panel); border-color: #d4d4d8; border-style: dashed; color: var(--faint); }
+  .cell-new { background: var(--green-bg); border-color: #6ee7b7; color: #047857; }
+  .iter-lbl { position: absolute; top: 44px; font-family: var(--mono); font-size: 10.5px; color: var(--faint); width: 112px; text-align: center; }
+  .row-lbl { position: absolute; font-family: var(--mono); font-size: 12.5px; color: var(--ink2); width: 56px; text-align: right; }
+  .util-box { position: absolute; right: 20px; bottom: 10px; text-align: right; }
+  .util-big { font-family: var(--mono); font-size: 30px; font-weight: 650; }
+  .fill-annot { position: absolute; font-size: 12px; color: var(--green); font-weight: 600; opacity: 0; }
+</style>
+</head>
+<body>
+<div id="root" data-composition-id="continuous-batching" data-start="0" data-duration="13" data-width="1280" data-height="720">
+  <header class="hf-head">
+    <div class="hf-head-text">
+      <span class="hf-kicker">Chapter 02 · KV Cache 与内存优化</span>
+      <h1 class="hf-title">Continuous Batching：完成即补位，GPU 不空转</h1>
+    </div>
+    <span class="hf-chapter">05 / 12</span>
+  </header>
+
+  <div id="scene">
+    <div class="panel lane" id="lane-static">
+      <span class="stage-label">Static Batching · 凑齐一批，跑完才换</span>
+      <span class="lane-badge badge badge-red">slot 空转</span>
+      <div class="grid" id="grid-static"></div>
+      <div class="util-box">
+        <div class="label">GPU 利用率</div>
+        <div class="util-big" style="color:var(--red);" id="util-static">0%</div>
+      </div>
+    </div>
+    <div class="panel lane" id="lane-cont">
+      <span class="stage-label">Continuous Batching · 每个 iteration 都可进出</span>
+      <span class="lane-badge badge badge-green">iteration-level scheduling</span>
+      <div class="grid" id="grid-cont"></div>
+      <div class="util-box">
+        <div class="label">GPU 利用率</div>
+        <div class="util-big" style="color:var(--green);" id="util-cont">0%</div>
+      </div>
+      <span class="fill-annot" id="annot-d" style="left:560px;top:216px;">← B 完成，D 立即补位</span>
+      <span class="fill-annot" id="annot-e" style="left:800px;top:216px;">← A 完成，E 立即补位</span>
+    </div>
+  </div>
+
+  <footer class="hf-caption"><span class="cap-dot"></span><span id="cap-text"></span></footer>
+</div>
+<script src="gsap.min.js"></script>
+<script>
+(function () {
+  var X0 = 84, DX = 120, ROWY = [76, 126, 176];
+  // grid: [slot行][iter列] = {req, kind}  kind: gen / idle / new
+  var staticPlan = [
+    ["A", "A", "A", "A", "A", "A", "idle", "idle"],
+    ["B", "B", "B", "B", "idle", "idle", "idle", "idle"],
+    ["C", "C", "C", "C", "C", "C", "C", "C"]
+  ];
+  var contPlan = [
+    ["A", "A", "A", "A", "A", "A", "E+", "E+"],
+    ["B", "B", "B", "B", "D+", "D+", "D+", "D+"],
+    ["C", "C", "C", "C", "C", "C", "C", "C"]
+  ];
+
+  function build(gridId, plan, prefix) {
+    var grid = document.getElementById(gridId);
+    ["slot 1", "slot 2", "slot 3"].forEach(function (lbl, r) {
+      var el = document.createElement("span");
+      el.className = "row-lbl";
+      el.textContent = lbl;
+      el.style.left = "14px";
+      el.style.top = ROWY[r] + 10 + "px";
+      grid.appendChild(el);
+    });
+    for (var i = 0; i < 8; i++) {
+      var h = document.createElement("span");
+      h.className = "iter-lbl";
+      h.textContent = "iter " + (i + 1);
+      h.style.left = X0 + i * DX + "px";
+      grid.appendChild(h);
+    }
+    plan.forEach(function (row, r) {
+      row.forEach(function (req, c) {
+        var cell = document.createElement("div");
+        var idle = req === "idle";
+        var isNew = req.slice(-1) === "+";
+        cell.className = "cell " + (idle ? "cell-idle" : isNew ? "cell-new" : "cell-gen");
+        cell.id = prefix + "-" + r + "-" + c;
+        cell.textContent = idle ? "空转" : req.replace("+", "") + " · gen";
+        cell.style.left = X0 + c * DX + "px";
+        cell.style.top = ROWY[r] + "px";
+        grid.appendChild(cell);
+      });
+    });
+  }
+  build("grid-static", staticPlan, "s");
+  build("grid-cont", contPlan, "c");
+
+  var tl = gsap.timeline({ paused: true, defaults: { ease: "power2.inOut" } });
+  var cap = function (t, text) { tl.set("#cap-text", { textContent: text }, t); };
+
+  cap(0, "同一批请求的生成长度各不相同 —— 批处理怎么排才不浪费 GPU？");
+  tl.fromTo("#lane-static", { autoAlpha: 0, y: 16 }, { autoAlpha: 1, y: 0, duration: 0.5 }, 0.2);
+  tl.fromTo("#lane-cont", { autoAlpha: 0, y: 16 }, { autoAlpha: 1, y: 0, duration: 0.5 }, 0.35);
+
+  // Static: 按 iteration 逐列揭示
+  cap(1.2, "Static Batching：凑齐 A/B/C 才开始，整批跑完才处理下一批");
+  for (var c = 0; c < 8; c++) {
+    for (var r = 0; r < 3; r++) {
+      tl.fromTo("#s-" + r + "-" + c, { autoAlpha: 0, scale: 0.7 }, { autoAlpha: 1, scale: 1, duration: 0.25 }, 1.4 + c * 0.32 + r * 0.05);
+    }
+  }
+  cap(4.4, "B 在 iter 4 结束、A 在 iter 6 结束 —— 但它们的 slot 只能空转等 C");
+  tl.set("#util-static", { textContent: "67%" }, 5.2);
+  tl.to("#lane-static .cell-idle", { borderColor: "#fca5a5", color: "#dc2626", duration: 0.4, stagger: 0.05 }, 5.0);
+  cap(6.4, "Static：整批时长由最长的请求决定，利用率被空转吃掉");
+
+  // Continuous
+  cap(7.2, "Continuous Batching：每个 iteration 边界，完成的退出、新请求立即补位（Orca）");
+  for (var c2 = 0; c2 < 8; c2++) {
+    for (var r2 = 0; r2 < 3; r2++) {
+      var id = "#c-" + r2 + "-" + c2;
+      var isNew = contPlan[r2][c2].slice(-1) === "+";
+      tl.fromTo(id, { autoAlpha: 0, scale: 0.7, y: isNew ? -14 : 0 }, { autoAlpha: 1, scale: 1, y: 0, duration: 0.25, ease: isNew ? "back.out(1.8)" : "power2.out" }, 7.4 + c2 * 0.3 + r2 * 0.05);
+    }
+  }
+  tl.to("#annot-d", { autoAlpha: 1, duration: 0.4 }, 9.0);
+  tl.to("#annot-e", { autoAlpha: 1, duration: 0.4 }, 9.5);
+  tl.set("#util-cont", { textContent: "≈100%" }, 10.0);
+  cap(10.2, "利用率 ≈100%：同样的 GPU，吞吐可翻倍 —— vLLM / TGI / SGLang 的标配");
+  tl.to("#scene", { autoAlpha: 0, duration: 0.5 }, 12.4);
+
+  window.__timelines = window.__timelines || {};
+  window.__timelines["continuous-batching"] = tl;
+  if (new URLSearchParams(location.search).has("autoplay")) { tl.repeat(-1).play(); }
+})();
+</script>
+</body>
+</html>

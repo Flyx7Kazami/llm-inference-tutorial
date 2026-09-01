@@ -1,0 +1,784 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 · 推理集群与基础设施 · LLM 推理优化</title>
+<meta name="description" content="Autoscaling、负载均衡与路由、GPU 资源管理、CPU/GPU 混合部署与成本优化。">
+<link rel="stylesheet" href="../assets/blog.css?v=1788185626">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2318181b'/%3E%3Ctext x='16' y='22' font-family='Menlo,monospace' font-size='17' font-weight='600' fill='%23fafafa' text-anchor='middle'%3E%CE%BB%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<header class="site-header">
+  <div class="container header-inner">
+    <a class="brand" href="../index.html">
+      <span class="brand-mark">λ</span>
+      <span class="brand-name">LLM 推理优化</span>
+    </a>
+    <nav class="site-nav"><a href="../chapters/01_inference_fundamentals.html" title="第 01 章">01</a><a href="../chapters/02_kv_cache_and_memory.html" title="第 02 章">02</a><a href="../chapters/03_quantization.html" title="第 03 章">03</a><a href="../chapters/04_parallelism_and_serving.html" title="第 04 章">04</a><a href="../chapters/05_advanced_techniques.html" title="第 05 章">05</a><a href="../chapters/06_framework_ecosystem.html" title="第 06 章">06</a><a href="../chapters/07_cluster_and_infra.html" title="第 07 章">07</a></nav>
+    <details class="mobile-nav">
+      <summary>章节</summary>
+      <div class="mobile-nav-panel"><a href="../chapters/01_inference_fundamentals.html" title="第 01 章">01</a><a href="../chapters/02_kv_cache_and_memory.html" title="第 02 章">02</a><a href="../chapters/03_quantization.html" title="第 03 章">03</a><a href="../chapters/04_parallelism_and_serving.html" title="第 04 章">04</a><a href="../chapters/05_advanced_techniques.html" title="第 05 章">05</a><a href="../chapters/06_framework_ecosystem.html" title="第 06 章">06</a><a href="../chapters/07_cluster_and_infra.html" title="第 07 章">07</a></div>
+    </details>
+  </div>
+</header>
+<main class="container main-grid">
+  <article class="prose">
+<div class="chapter-head"><div class="breadcrumb"><a href="../index.html">首页</a><span class="sep">/</span>第 07 章</div></div><h1 id="第七章推理集群与基础设施-怎么把模型跑在云上">第七章：推理集群与基础设施 —— 怎么把模型跑在"云"上？</h1>
+<blockquote class="callout">
+<p>前六章讲的都是单机/单集群内的优化，这章讲更上层的"运维视角"：
+怎么把多个推理实例组成一个服务？怎么弹性伸缩？怎么省钱？</p>
+</blockquote>
+<h2 id="1-gpu-推理集群架构">1. GPU 推理集群架构</h2>
+<h3 id="11-典型架构">1.1 典型架构</h3>
+<div class="dg">
+  <div class="dg-flow" style="flex-direction:column;align-items:stretch;max-width:640px;margin:0 auto">
+    <div class="dg-node" style="text-align:center"><div class="t">用户</div></div>
+    <div class="dg-arrow" style="justify-content:center">↓</div>
+    <div class="dg-node" style="text-align:center">
+      <div class="t">Load Balancer</div>
+      <div class="l">Nginx / AWS ALB / …</div>
+    </div>
+    <div class="dg-arrow" style="justify-content:center">↓</div>
+    <div class="dg-node" style="text-align:center">
+      <div class="t">API Gateway / Router</div>
+      <div class="dg-cells" style="justify-content:center;margin-top:8px;flex-wrap:wrap;row-gap:6px"><i class="c-blue">限流</i><i class="c-blue">鉴权</i><i class="c-blue">路由（Model→实例）</i><i class="c-blue">流量镜像 / 灰度</i></div>
+    </div>
+    <div class="dg-arrow" style="justify-content:center">↓</div>
+    <div class="dg-flow" style="flex-wrap:nowrap">
+      <div class="dg-node" style="text-align:center"><div class="t">Replica Pod 0</div><div class="l">vLLM · 4×A100</div></div>
+      <div class="dg-node" style="text-align:center"><div class="t">Replica Pod 1</div><div class="l">vLLM · 4×A100</div></div>
+      <div class="dg-node" style="text-align:center"><div class="t">Replica Pod 2</div><div class="l">vLLM · 4×A100</div></div>
+    </div>
+    <div class="dg-arrow" style="justify-content:center">↑</div>
+    <div class="dg-node" style="text-align:center;border-style:dashed">
+      <div class="t">GPU Node Pool</div>
+      <div class="l">Kubernetes / Slurm / Ray</div>
+    </div>
+  </div>
+</div>
+
+<h3 id="12-关键组件">1.2 关键组件</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>组件</th>
+<th>职责</th>
+<th>常见选择</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Load Balancer</td>
+<td>L4/L7 流量分发</td>
+<td>AWS ALB, Nginx, Envoy</td>
+</tr>
+<tr>
+<td>API Gateway</td>
+<td>路由、限流、鉴权</td>
+<td>Kong, FastAPI + 中间件</td>
+</tr>
+<tr>
+<td>Scheduler</td>
+<td>请求→实例调度</td>
+<td>vLLM 内置 / 自研</td>
+</tr>
+<tr>
+<td>Instance Manager</td>
+<td>实例生命周期管理</td>
+<td>K8s Operator, Ray Serve</td>
+</tr>
+<tr>
+<td>Autoscaler</td>
+<td>弹性伸缩</td>
+<td>K8s HPA/VPA, 自研</td>
+</tr>
+<tr>
+<td>Monitor</td>
+<td>可观测性</td>
+<td>Prometheus + Grafana</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="2-autoscaling自动伸缩">2. Autoscaling（自动伸缩）</h2>
+<figure class="anim-figure"><figcaption><span class="anim-badge"><svg viewBox="0 0 24 24" fill="currentColor" width="11" height="11"><path d="M8 5.5v13l11-6.5z"/></svg>动画演示</span><span class="anim-title">LLM Autoscaling：冷启动与预测式扩容</span><a class="anim-open" href="../animations/llm-autoscaling/index.html?autoplay=1" target="_blank" rel="noopener">新窗口打开<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="11" height="11"><path d="M7 17L17 7M9 7h8v8"/></svg></a></figcaption><div class="anim-embed"><iframe src="../animations/llm-autoscaling/index.html?autoplay=1" title="LLM Autoscaling：冷启动与预测式扩容" loading="lazy" scrolling="no"></iframe></div><p class="anim-caption">GPU 实例冷启动要 5–10 分钟，反应式扩容必然滞后于流量突增；预测式扩容提前就位，削平排队尖峰。</p></figure>
+<h3 id="21-为什么需要-autoscaling">2.1 为什么需要 Autoscaling？</h3>
+<p>LLM 推理的流量有鲜明的特点：</p>
+<div class="codehilite"><pre><span></span><code>流量模式：
+  · 日周期：白天高峰、凌晨低谷
+  · 突发：热门事件 → 10x 流量突增
+  · 长尾：凌晨流量可能只有白天的 1/20
+
+不用 Autoscaling：
+  · 按峰值配置 → 凌晨 GPU 闲置，成本浪费 80%+
+  · 按均值配置 → 高峰时排队严重，SLO 违约
+</code></pre></div>
+
+<p><strong>GPU 不便宜</strong>：A100 约 $2-3/小时，8×A100 节点约 $20/小时。多跑 10 台不必要的实例 = 每天浪费 $4800。</p>
+<h3 id="22-autoscaling-的类型">2.2 Autoscaling 的类型</h3>
+<h4 id="221-horizontal-pod-autoscalerhpa水平伸缩">2.2.1 Horizontal Pod Autoscaler（HPA，水平伸缩）</h4>
+<p><strong>最常用</strong>：增减推理实例（Pod）数量</p>
+<div class="codehilite"><pre><span></span><code>                请求量 ↑
+                   │
+            ┌──────▼──────┐
+            │   HPA 控制器  │
+            │              │
+            │ 指标 &gt; 阈值？ │──是──► 创建新 Pod
+            │              │
+            │ 指标 &lt; 阈值？ │──是──► 缩减 Pod
+            └──────────────┘
+</code></pre></div>
+
+<p><strong>K8s HPA 核心参数</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">autoscaling/v2</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">HorizontalPodAutoscaler</span>
+<span class="nt">spec</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">minReplicas</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2</span><span class="w">          </span><span class="c1"># 最少保持 2 个实例</span>
+<span class="w">  </span><span class="nt">maxReplicas</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">20</span><span class="w">         </span><span class="c1"># 最多扩展到 20 个</span>
+<span class="w">  </span><span class="nt">metrics</span><span class="p">:</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Pods</span>
+<span class="w">    </span><span class="nt">pods</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">metric</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">gpu_utilization</span><span class="w">   </span><span class="c1"># 监控 GPU 利用率</span>
+<span class="w">      </span><span class="nt">target</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Utilization</span>
+<span class="w">        </span><span class="nt">averageUtilization</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">70</span><span class="w">  </span><span class="c1"># 目标利用率 70%</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Pods</span>
+<span class="w">    </span><span class="nt">pods</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">metric</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">request_queue_depth</span><span class="w">  </span><span class="c1"># 监控排队深度</span>
+<span class="w">      </span><span class="nt">target</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">AverageValue</span>
+<span class="w">        </span><span class="nt">averageValue</span><span class="p">:</span><span class="w"> </span><span class="s">"10"</span><span class="w">         </span><span class="c1"># 平均排队不超过 10</span>
+<span class="w">  </span><span class="nt">behavior</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">scaleUp</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">stabilizationWindowSeconds</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">30</span><span class="w">   </span><span class="c1"># 30s 内不重复扩</span>
+<span class="w">      </span><span class="nt">policies</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Pods</span>
+<span class="w">        </span><span class="nt">value</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">4</span><span class="w">                        </span><span class="c1"># 每次最多加 4 个 Pod</span>
+<span class="w">        </span><span class="nt">periodSeconds</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">60</span>
+<span class="w">    </span><span class="nt">scaleDown</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">stabilizationWindowSeconds</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">300</span><span class="w">   </span><span class="c1"># 缩容要观察 5 分钟</span>
+<span class="w">      </span><span class="nt">policies</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Percent</span>
+<span class="w">        </span><span class="nt">value</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">10</span><span class="w">                        </span><span class="c1"># 每次最多缩 10%</span>
+<span class="w">        </span><span class="nt">periodSeconds</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">60</span>
+</code></pre></div>
+
+<h4 id="222-vertical-pod-autoscalervpa垂直伸缩">2.2.2 Vertical Pod Autoscaler（VPA，垂直伸缩）</h4>
+<p>调整单个 Pod 的资源请求（GPU 数量、内存等）。LLM 推理中较少使用，因为 GPU 数量通常由模型并行度决定，不好动态调整。</p>
+<h4 id="223-cluster-autoscalerca集群伸缩">2.2.3 Cluster Autoscaler（CA，集群伸缩）</h4>
+<p>HPA 决定"要多少 Pod"，CA 决定"集群有没有足够的 Node 来放这些 Pod"。</p>
+<div class="codehilite"><pre><span></span><code>HPA: 需要 15 个 Pod，但集群只有 10 个 Node 的容量
+  → HPA 创建 Pod → Pending（没有 Node 可调度）
+  → CA 检测到 Pending Pod → 向云厂商申请新 Node
+  → 新 Node 就绪 → Pod 被调度 → 开始服务
+</code></pre></div>
+
+<p><strong>关键延迟</strong>：</p>
+<ul>
+<li>申请新 GPU Node：2-5 分钟（云厂商启动时间）</li>
+<li>拉取模型镜像：1-3 分钟（几十 GB 的模型镜像）</li>
+<li>模型加载到 GPU：30s-2min（取决于模型大小和存储速度）</li>
+</ul>
+<p><strong>从"需要扩容"到"新实例就绪"通常需要 5-10 分钟！</strong> 这是 LLM 推理 autoscaling 的核心挑战。</p>
+<h3 id="23-llm-autoscaling-的特殊挑战">2.3 LLM Autoscaling 的特殊挑战</h3>
+<h4 id="挑战-1冷启动慢">挑战 1：冷启动慢</h4>
+<div class="codehilite"><pre><span></span><code>传统 Web 服务冷启动: ~1s
+LLM 推理冷启动:     ~5-10min（加载 70B 模型 + 预热）
+
+→ 流量突增时，等新实例来不及
+</code></pre></div>
+
+<p><strong>解决方案</strong>：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>方案</th>
+<th>做法</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>预热池 (Warm Pool)</td>
+<td>保持若干"已加载模型但未接入流量"的实例</td>
+<td>常驻 GPU 费用</td>
+</tr>
+<tr>
+<td>模型预加载</td>
+<td>Node 启动时就拉取模型到本地盘</td>
+<td>存储（每 Node 副本）</td>
+</tr>
+<tr>
+<td>Serverless GPU</td>
+<td>云厂商管理冷启动（如 AWS SageMaker Endpoint）</td>
+<td>成本略高，灵活性低</td>
+</tr>
+<tr>
+<td>量化 + 更小模型</td>
+<td>用 AWQ INT4 → 加载快 2-4x</td>
+<td>精度损失</td>
+</tr>
+</tbody>
+</table></div>
+<h4 id="挑战-2指标选择">挑战 2：指标选择</h4>
+<p>传统 Web 服务用 CPU/内存利用率做 HPA 指标，LLM 推理应该用什么？</p>
+<div class="codehilite"><pre><span></span><code>❌ CPU 利用率：推理主要在 GPU 上，CPU 指标无意义
+❌ 内存利用率：GPU 显存 ≠ 主机内存
+⚠️ GPU 利用率：有一定参考价值，但 decode 阶段利用率本身就很低
+✅ 请求队列深度 (Queue Depth)：最直接 —— 排队多 = 不够用
+✅ 活跃请求数 / 最大并发数：利用率指标
+✅ TTFT / TPOT：SLO 指标 —— 延迟升高 = 需要扩容
+✅ KV Cache 利用率：显存维度 —— 快满了 = 放不下更多请求
+</code></pre></div>
+
+<p><strong>推荐组合</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="nt">metrics</span><span class="p">:</span>
+<span class="w">  </span><span class="c1"># 主指标：排队深度</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">request_queue_depth</span>
+<span class="w">    </span><span class="nt">target</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">5</span>
+<span class="w">  </span><span class="c1"># 辅助指标：KV Cache 利用率（防止 OOM）</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">kv_cache_utilization</span>
+<span class="w">    </span><span class="nt">target</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">80%</span>
+<span class="w">  </span><span class="c1"># SLO 指标：TPOT 不超过 50ms</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">tpot_p99</span>
+<span class="w">    </span><span class="nt">target</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">50ms</span>
+</code></pre></div>
+
+<h4 id="挑战-3缩容的安全窗口">挑战 3：缩容的安全窗口</h4>
+<div class="codehilite"><pre><span></span><code>危险：刚缩掉一个 Pod，流量又来了 → 冷启动 5-10min → 雪崩
+
+安全做法：
+  · scaleDown.stabilizationWindowSeconds: 300-600
+  · 缩容步长要小（每次最多缩 1-2 个 Pod）
+  · 优先缩"最空闲"的 Pod
+  · 优雅终止：等待当前请求完成，不接受新请求
+</code></pre></div>
+
+<h3 id="24-预测性扩容predictive-autoscaling">2.4 预测性扩容（Predictive Autoscaling）</h3>
+<p><strong>思路</strong>：基于历史流量模式，提前扩容，避免冷启动延迟。</p>
+<div class="codehilite"><pre><span></span><code>常规 HPA:
+  流量突增 → 队列积压 → 触发扩容 → 等 5-10min → 实例就绪
+  └── 已经有用户等了很久 ──┘
+
+预测性扩容:
+  历史模式 → 预测"明天 10:00 流量会涨" → 提前 10min 扩容
+  → 流量到达时实例已就绪 ✓
+</code></pre></div>
+
+<p>实现方式：</p>
+<ul>
+<li><strong>KEDA</strong>：K8s 的事件驱动 autoscaler，支持 cron trigger</li>
+<li><strong>自定义控制器</strong>：用历史数据训练简单的时序预测模型</li>
+<li><strong>混合策略</strong>：预测性扩容做基线 + HPA 做微调</li>
+</ul>
+<h3 id="25-优先级与抢占">2.5 优先级与抢占</h3>
+<p>当 GPU 资源不够时，不同请求/租户的优先级不同：</p>
+<div class="codehilite"><pre><span></span><code>优先级（从高到低）：
+  1. 在线推理请求 (SLO 严格)
+  2. 在线推理请求 (SLO 宽松)
+  3. 批量推理 (离线任务)
+  4. 模型预热 / 测试
+</code></pre></div>
+
+<p>K8s 的 PriorityClass + Preemption：</p>
+<div class="codehilite"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">scheduling.k8s.io/v1</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">PriorityClass</span>
+<span class="nt">metadata</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">high-priority-inference</span>
+<span class="nt">value</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1000</span>
+<span class="nt">preemptionPolicy</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">PreemptLowerPriority</span>
+<span class="nt">globalDefault</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span>
+<span class="nn">---</span>
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">scheduling.k8s.io/v1</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">PriorityClass</span>
+<span class="nt">metadata</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">batch-inference</span>
+<span class="nt">value</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">100</span>
+<span class="nt">preemptionPolicy</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">PreemptLowerPriority</span>
+<span class="nt">globalDefault</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span>
+</code></pre></div>
+
+<h2 id="3-负载均衡与请求路由">3. 负载均衡与请求路由</h2>
+<h3 id="31-为什么传统-lb-不够">3.1 为什么传统 LB 不够？</h3>
+<div class="codehilite"><pre><span></span><code>传统 LB (Round-Robin):
+  请求1 → Pod A (正在跑长序列，GPU 满载)
+  请求2 → Pod B (空闲)
+  请求3 → Pod A (继续往满载实例塞)
+
+  → Pod A 过载，Pod B 闲置
+</code></pre></div>
+
+<p>LLM 推理需要<strong>感知实例状态</strong>的路由。</p>
+<h3 id="32-感知负载的路由策略">3.2 感知负载的路由策略</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>策略</th>
+<th>做法</th>
+<th>优缺点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Least Connections</td>
+<td>路由到当前连接数最少的实例</td>
+<td>简单有效，但不感知 GPU 状态</td>
+</tr>
+<tr>
+<td>KV Cache Aware</td>
+<td>路由到 KV Cache 余量最多的实例</td>
+<td>显存维度最优，但需实例上报状态</td>
+</tr>
+<tr>
+<td>Prefix-Aware</td>
+<td>路由到已有相同 prefix cache 的实例</td>
+<td>利用 prefix caching，减少重复计算</td>
+</tr>
+<tr>
+<td>Queue-Depth Based</td>
+<td>路由到排队最短的实例</td>
+<td>延迟维度最优</td>
+</tr>
+<tr>
+<td>Random + Retry</td>
+<td>随机路由，超时重试其他实例</td>
+<td>最简单，但效率低</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>推荐</strong>：KV Cache Aware + Prefix-Aware 组合</p>
+<div class="codehilite"><pre><span></span><code>请求来了:
+  1. 有没有实例已经缓存了这个 system prompt？
+     → 有 → 路由过去（复用 prefix KV Cache）
+  2. 没有缓存 → 哪个实例 KV Cache 余量多？
+     → 路由到余量多的实例
+  3. 所有实例都快满了 → 触发扩容
+</code></pre></div>
+
+<h3 id="33-会话亲和性session-affinity">3.3 会话亲和性（Session Affinity）</h3>
+<p>多轮对话场景，同一用户的不同轮次应尽量路由到同一实例：</p>
+<div class="codehilite"><pre><span></span><code>用户A 第1轮: [system_prompt + 问题1] → 实例1（缓存 system_prompt KV）
+用户A 第2轮: [system_prompt + 问题2] → 实例1（复用 KV Cache！）
+
+如果路由到实例2:
+  → 实例2 没有 system_prompt 的 KV Cache
+  → 要重新 prefill 整个 system_prompt → 慢 + 浪费显存
+</code></pre></div>
+
+<p>实现方式：基于 <code>session_id</code> 的 consistent hashing。</p>
+<h2 id="4-gpu-资源管理">4. GPU 资源管理</h2>
+<h3 id="41-gpu-型号选择">4.1 GPU 型号选择</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>GPU</th>
+<th>显存</th>
+<th>算力(FP16)</th>
+<th>带宽</th>
+<th>适合场景</th>
+<th>大致成本</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A10</td>
+<td>24GB</td>
+<td>125 TFLOPS</td>
+<td>600 GB/s</td>
+<td>7B 量化模型</td>
+<td>~$1.5/h</td>
+</tr>
+<tr>
+<td>L4</td>
+<td>24GB</td>
+<td>120 TFLOPS</td>
+<td>300 GB/s</td>
+<td>7B 量化，性价比之选</td>
+<td>~$0.8/h</td>
+</tr>
+<tr>
+<td>A100 40GB</td>
+<td>40GB</td>
+<td>312 TFLOPS</td>
+<td>1.6 TB/s</td>
+<td>7B/13B FP16</td>
+<td>~$2/h</td>
+</tr>
+<tr>
+<td>A100 80GB</td>
+<td>80GB</td>
+<td>312 TFLOPS</td>
+<td>2 TB/s</td>
+<td>70B 量化</td>
+<td>~$3/h</td>
+</tr>
+<tr>
+<td>H100 80GB</td>
+<td>80GB</td>
+<td>990 TFLOPS</td>
+<td>3.4 TB/s</td>
+<td>70B+ FP8，极致性能</td>
+<td>~$4/h</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>选型原则</strong>：</p>
+<div class="dg dg-tree">
+  <ul>
+    <li><span class="root">模型能放进单卡吗？</span>
+      <ul>
+        <li><span class="yes">能</span> → <span class="em">多大 / 什么追求？</span>
+          <ul>
+            <li>7B 量化 → <b>L4 / A10</b> <span class="dim">便宜</span></li>
+            <li>13B / 70B 量化 → <b>A100 80GB</b></li>
+            <li>追求极致 → <b>H100</b></li>
+          </ul>
+        </li>
+        <li><span class="no">不能</span> → 需要多少卡？→ <b>多卡 TP</b>，确保 <b>NVLink</b> 互联</li>
+      </ul>
+    </li>
+  </ul>
+</div>
+
+<h3 id="42-异构集群mixed-gpu-types">4.2 异构集群（Mixed GPU Types）</h3>
+<p>实际生产中往往有多种 GPU，需要智能调度：</p>
+<div class="codehilite"><pre><span></span><code>集群:
+  Node Group A: 4× H100 (推理主力，跑大模型)
+  Node Group B: 8× A100 (跑中模型 / overflow)
+  Node Group C: 16× L4 (跑小模型 / 低优先级任务)
+
+调度策略:
+  · 70B FP8 → H100
+  · 70B AWQ INT4 → A100
+  · 7B / 13B → L4
+  · overflow 请求 → 自动降级到下一级 GPU
+</code></pre></div>
+
+<h3 id="43-mig-multi-instance-gpu">4.3 MIG (Multi-Instance GPU)</h3>
+<p>A100/H100 支持 MIG：一张卡切分成多个实例，每个实例独立执行。</p>
+<div class="codehilite"><pre><span></span><code>A100 80GB MIG 模式:
+  · 1g.10gb: 10GB 显存，1/7 算力 → 跑 7B INT4
+  · 2g.20gb: 20GB 显存，2/7 算力 → 跑 7B FP16
+  · 3g.40gb: 40GB 显存，3/7 算力 → 跑 13B INT4
+  · 4g.40gb: 40GB 显存，4/7 算力 → 跑 13B FP16
+  · 7g.80gb: 80GB 显存，全部算力 → 不切分
+
+场景：
+  小模型推理时，一张 A100 切 4 份，同时跑 4 个 7B 实例
+  → GPU 利用率从 20% 提升到 80%
+</code></pre></div>
+
+<h3 id="44-gpu-时间片共享time-slicing">4.4 GPU 时间片共享（Time-Slicing）</h3>
+<p>更粗暴的方式：多个 Pod 共享一张 GPU，时间片轮转。</p>
+<div class="dg">
+  <div class="dg-lanes">
+    <div class="dg-row"><span class="dg-lab">GPU 时间线</span><span class="dg-cells"><i class="c-blue grow">Pod A · 10ms</i><i class="c-green grow">Pod B · 10ms</i><i class="c-amber grow">Pod C · 10ms</i><i class="c-blue grow">A</i><i class="c-green grow">B</i><i class="c-amber grow">C</i></span></div>
+  </div>
+  <div class="dg-cap">优点：简单，不需要 MIG 支持 ｜ 缺点：上下文切换开销、隔离性差、性能波动大 → 适合低优先级/开发测试，不适合生产在线推理</div>
+</div>
+
+<h3 id="45-显存虚拟化unified-memory-cuda-um">4.5 显存虚拟化（Unified Memory / CUDA UM）</h3>
+<div class="codehilite"><pre><span></span><code>传统方式：
+  模型必须完全装入 GPU 显存，放不下就报 OOM
+
+显存虚拟化：
+  GPU 显存 + 主机内存组成统一地址空间
+  频繁访问的权重留在 GPU，冷数据换出到 CPU 内存
+  需要时再换入
+
+优点：可以在小显存 GPU 上跑大模型
+缺点：换入换出延迟高，decode 性能下降明显
+
+适合：低流量 / 大模型 / 显存不足的场景
+实现：llama.cpp 的 CPU+GPU 混合推理
+</code></pre></div>
+
+<h2 id="5-cpu-推理与混合部署">5. CPU 推理与混合部署</h2>
+<h3 id="51-什么时候用-cpu">5.1 什么时候用 CPU？</h3>
+<div class="codehilite"><pre><span></span><code>适合 CPU 的场景：
+  · 小模型（7B 以下）+ 量化（INT4/INT8）
+  · 低流量、延迟不敏感
+  · 离线批量推理
+  · 开发测试环境
+  · 没有 GPU 的边缘节点
+
+不适合 CPU 的场景：
+  · 在线实时推理（延迟要求 &lt; 200ms）
+  · 大模型（70B+）
+  · 高吞吐需求
+</code></pre></div>
+
+<h3 id="52-cpu-推理框架">5.2 CPU 推理框架</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>框架</th>
+<th>特点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>llama.cpp</td>
+<td>C++ 实现，支持 AVX2/AVX-512/NEON，量化支持好</td>
+</tr>
+<tr>
+<td>GGML/GGUF</td>
+<td>llama.cpp 的模型格式，CPU 优化成熟</td>
+</tr>
+<tr>
+<td>Intel BigDL-LLM</td>
+<td>Intel CPU 专用优化（AMX 指令集）</td>
+</tr>
+<tr>
+<td>ONNX Runtime</td>
+<td>通用 CPU 推理，支持量化</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="53-cpu-gpu-混合推理">5.3 CPU + GPU 混合推理</h3>
+<div class="codehilite"><pre><span></span><code>方案 1: CPU Offloading（部分层放 CPU）
+  GPU: Layer 0-19（热层，频繁访问）
+  CPU: Layer 20-39（冷层，偶尔访问）
+
+  → 适合单卡放不下的模型
+  → 性能取决于 CPU↔GPU 传输带宽 (PCIe 4.0: ~64 GB/s)
+
+方案 2: Prefill on CPU, Decode on GPU
+  CPU: 处理长 prompt 的 prefill（compute-bound，CPU 多核可以胜任）
+  GPU: 做 decode（memory-bound，GPU 带宽优势）
+
+  → 适合 CPU 核心多的服务器
+  → KV Cache 需要从 CPU 传到 GPU
+
+方案 3: CPU 做后备
+  GPU 实例正常服务
+  流量溢出时，CPU 实例兜底（延迟高但不拒绝请求）
+
+  → 适合应对突发流量，避免冷启动
+</code></pre></div>
+
+<h2 id="6-成本优化">6. 成本优化</h2>
+<h3 id="61-成本构成">6.1 成本构成</h3>
+<div class="codehilite"><pre><span></span><code>LLM 推理服务月成本（示例，70B 模型，8×A100 集群）：
+
+  GPU 实例:     $40,000  (80%)  ← 大头
+  网络 (InfiniBand/VPC): $3,000  (6%)
+  存储 (模型/日志):  $2,000  (4%)
+  运维人力:      $5,000  (10%)
+  ──────────────────────
+  总计:          ~$50,000/月
+</code></pre></div>
+
+<h3 id="62-省钱策略">6.2 省钱策略</h3>
+<h4 id="策略-1spotpreemptible-实例">策略 1：Spot/Preemptible 实例</h4>
+<div class="codehilite"><pre><span></span><code>On-Demand A100:  ~$3/h
+Spot A100:       ~$1/h  (省 60-70%)
+
+风险：实例可能随时被回收
+
+应对：
+  · 推理本身是无状态的（KV Cache 可丢弃）
+  · 被回收 → 请求重试到其他实例
+  · 保持 50% On-Demand + 50% Spot → 成本降 30-35%
+  · Spot 被回收时，On-Demand 实例兜底
+</code></pre></div>
+
+<h4 id="策略-2量化降配">策略 2：量化降配</h4>
+<div class="codehilite"><pre><span></span><code>70B FP16: 4×A100  → $12/h
+70B AWQ:  2×A100  → $6/h   (省 50%)
+70B AWQ:  1×A100  → $3/h   (省 75%)
+
+精度损失可控（AWQ INT4 在大部分 benchmark 上损失 &lt; 1%）
+</code></pre></div>
+
+<h4 id="策略-3分层部署">策略 3：分层部署</h4>
+<div class="codehilite"><pre><span></span><code>热路径：H100 实例（少，快）→ SLO 敏感请求
+温路径：A100 实例（中等） → 普通请求
+冷路径：L4 实例（多，便宜）→ 批量/低优先级
+</code></pre></div>
+
+<h4 id="策略-4请求调度优化">策略 4：请求调度优化</h4>
+<div class="codehilite"><pre><span></span><code>不加区分：
+  所有请求 → 大模型实例 → 贵
+
+智能路由：
+  简单请求 → 小模型 (7B)  → 便宜
+  复杂请求 → 大模型 (70B) → 贵但准确
+
+  · 路由分类器判断请求复杂度
+  · 80% 的请求走小模型 → 整体成本降 60%
+
+  这就是 Cascade Inference / RouteLLM 的思路
+</code></pre></div>
+
+<h4 id="策略-5批处理窗口">策略 5：批处理窗口</h4>
+<div class="codehilite"><pre><span></span><code>实时推理：每个请求立即处理 → GPU 利用率低
+微批处理：积累 50ms 的请求一起处理 → 利用率 ↑
+
+  等待窗口: 0ms   → 吞吐 500 tok/s, 延迟 20ms
+  等待窗口: 50ms  → 吞吐 2000 tok/s, 延迟 40ms
+  等待窗口: 200ms → 吞吐 5000 tok/s, 延迟 180ms
+
+  → 在延迟 SLO 允许的范围内，适当积累 batch → 省钱
+</code></pre></div>
+
+<h2 id="7-可观测性">7. 可观测性</h2>
+<h3 id="71-关键监控指标">7.1 关键监控指标</h3>
+<div class="codehilite"><pre><span></span><code>基础设施层:
+  · GPU 利用率 (DCGM)
+  · GPU 显存使用率
+  · GPU 温度 / 功耗
+  · PCIe/NVLink 带宽利用率
+  · 节点 CPU / 内存 / 网络
+
+推理层:
+  · TTFT (P50/P95/P99)
+  · TPOT (P50/P95/P99)
+  · 吞吐 (tokens/s, requests/s)
+  · 批大小 (batch_size)
+  · KV Cache 利用率
+  · 队列深度
+  · 请求成功率 / 超时率
+
+业务层:
+  · 每日活跃用户
+  · 平均请求长度 (input/output)
+  · 每千 token 成本
+  · SLO 达标率
+</code></pre></div>
+
+<h3 id="72-告警策略">7.2 告警策略</h3>
+<div class="codehilite"><pre><span></span><code><span class="nt">alerts</span><span class="p">:</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">HighTPOT</span>
+<span class="w">    </span><span class="nt">condition</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">tpot_p99 &gt; 100ms for 2min</span>
+<span class="w">    </span><span class="nt">action</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">自动扩容 + 通知</span>
+
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">KVCacheNearFull</span>
+<span class="w">    </span><span class="nt">condition</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">kv_cache_util &gt; 90% for 1min</span>
+<span class="w">    </span><span class="nt">action</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">停止接受新请求 + 扩容</span>
+
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">GPUMemoryOOM</span>
+<span class="w">    </span><span class="nt">condition</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">gpu_memory_error_count &gt; 0</span>
+<span class="w">    </span><span class="nt">action</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">重启实例 + 通知</span>
+
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">HighQueueDepth</span>
+<span class="w">    </span><span class="nt">condition</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">queue_depth &gt; 50 for 3min</span>
+<span class="w">    </span><span class="nt">action</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">扩容 + 降低 batch_size</span>
+
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">SpotReclaim</span>
+<span class="w">    </span><span class="nt">condition</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">node_termination_signal</span>
+<span class="w">    </span><span class="nt">action</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">驱逐请求 + 启动替代实例</span>
+</code></pre></div>
+
+<h3 id="73-分布式追踪">7.3 分布式追踪</h3>
+<p>一个请求从用户发出到收到完整响应，可能经过：</p>
+<div class="codehilite"><pre><span></span><code>Client → CDN → LB → Gateway → Router → Instance →
+  Tokenizer → Scheduler → Prefill → Decode×N →
+  Detokenizer → Stream → Gateway → LB → CDN → Client
+</code></pre></div>
+
+<p>用 OpenTelemetry / Jaeger 追踪每个环节的耗时，快速定位瓶颈。</p>
+<h2 id="8-典型部署方案">8. 典型部署方案</h2>
+<h3 id="81-小规模创业公司-内部工具">8.1 小规模（创业公司 / 内部工具）</h3>
+<div class="codehilite"><pre><span></span><code>1-2 台 GPU 服务器
+  · vLLM 直接启动
+  · Nginx 做反向代理
+  · 简单的 shell 脚本监控
+  · 手动扩缩容
+
+成本: ~$5,000-10,000/月
+复杂度: 低
+</code></pre></div>
+
+<h3 id="82-中规模生产服务">8.2 中规模（生产服务）</h3>
+<div class="codehilite"><pre><span></span><code>K8s 集群
+  · vLLM / SGLang + K8s Deployment
+  · HPA + Cluster Autoscaler
+  · Prometheus + Grafana 监控
+  · Nginx Ingress / Envoy 路由
+
+成本: ~$20,000-100,000/月
+复杂度: 中
+</code></pre></div>
+
+<h3 id="83-大规模公有云-llm-服务">8.3 大规模（公有云 LLM 服务）</h3>
+<div class="codehilite"><pre><span></span><code>多区域 K8s 集群
+  · TensorRT-LLM / 自研推理引擎
+  · 自研调度器（感知 KV Cache、prefix、SLO）
+  · 预测性 autoscaling + Spot 实例混部
+  · 分离式 prefill/decode 架构
+  · 全链路追踪 + SLO 自动化
+
+成本: ~$500,000+/月
+复杂度: 高
+</code></pre></div>
+
+<h2 id="9-推理平台开源项目">9. 推理平台开源项目</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>项目</th>
+<th>定位</th>
+<th>特点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Kserve</td>
+<td>K8s 原生模型服务</td>
+<td>支持 autoscaling、canary、多框架</td>
+</tr>
+<tr>
+<td>Triton Inference Server</td>
+<td>NVIDIA 推理服务</td>
+<td>GPU 优化好，支持多框架</td>
+</tr>
+<tr>
+<td>Ray Serve</td>
+<td>分布式推理服务</td>
+<td>Python 原生，autoscaling 内置</td>
+</tr>
+<tr>
+<td>BentoML</td>
+<td>ML 模型服务化</td>
+<td>API 友好，部署简单</td>
+</tr>
+<tr>
+<td>TorchServe</td>
+<td>PyTorch 官方</td>
+<td>与 PyTorch 生态紧密</td>
+</tr>
+<tr>
+<td>SkyPilot</td>
+<td>多云 GPU 管理</td>
+<td>统一接口跨云调度 GPU</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="思考题">思考题</h2>
+<ol class="quiz-list"><li>为什么 LLM 推理的 autoscaling 比传统 Web 服务难得多？冷启动问题有哪些解法？<details class="answer"><summary>参考答案</summary><p>难在三点：</p>
+<p>① 冷启动慢 2-3 个数量级：Web 服务秒级就绪，LLM 实例要申请 GPU 节点（2-5min）+ 拉取上百 GB 权重 + 加载预热（合计 5-10min），反应式扩容必然追不上流量突增。</p>
+<p>② 指标不直观：CPU/内存利用率失效，GPU 利用率在 decode 阶段天然很低（memory-bound，百分之几也正常），要用队列深度、KV Cache 利用率、TTFT/TPOT 这类业务指标。</p>
+<p>③ 缩容危险：刚缩掉实例流量就回来 = 5-10min 雪崩，需要长稳定窗口 + 小步长 + 优雅退出。</p>
+<p>冷启动解法：预热池（常备已加载模型、未接流量的 standby 实例，代价是常驻 GPU 费用）、节点预置模型（镜像/本地盘预拉权重，省下载时间）、量化（INT4 加载快 2-4 倍）、预测式扩容（用历史流量模式提前扩，让冷启动发生在流量到来之前，如 KEDA cron trigger 或时序预测）。</p></details></li><li>如果你有 10 台 8×A100 的服务器，既要服务 70B 模型又要服务 7B 模型，怎么分配？<details class="answer"><summary>参考答案</summary><p>先定量化策略：70B 用 AWQ INT4（≈35GB，TP=2 一个实例）；7B FP16 单卡即可。</p>
+<p>分配示例：70B 是重资产，给 6 台 → 每台 4 个 TP=2 实例，共 24 实例；7B 给 3 台 → 每台 8 个单卡实例，共 24 实例；留 1 台做预热池 / 灰度 / 突发兜底。</p>
+<p>几个原则：① 别让两种模型抢同一组 GPU——7B 实例白占 80GB 大显存卡是浪费，按机型/卡粒度隔离，调度器打 label；② 70B 池在长 prompt 场景下按 PD 分离组织更划算，7B 混部即可；③ 两个池的 HPA 指标、预热池独立配置；④ 机动那台平时可跑 Spot 批任务（离线评测等），流量高峰时征用。</p></details></li><li>Spot 实例省 60% 成本，但可能随时被回收。设计一个兼顾成本和可用性的混合策略。<details class="answer"><summary>参考答案</summary><p>核心思路：On-Demand 保基线 SLO，Spot 吃弹性增量。</p>
+<p>① 分层容量：常备 ~50%（对齐 p50 流量）On-Demand 实例兜底，Spot 全部被回收时服务降质不降级（排队变长，但不断流）；Spot 提供另外 50% 容量，成本直降 30-35%。</p>
+<p>② 回收应对：监听 reclaim 预警（云厂商提前 30s-2min 通知）→ 立即停止派新请求 + 优雅排空在途请求 + 触发 On-Demand 池扩容；K8s 上配 PodDisruptionBudget 限制并发回收比例。</p>
+<p>③ 异构对冲：Spot 跨可用区、跨机型混布（A100 Spot 没了还有 H100 Spot），单点回收不致命。</p>
+<p>④ 无状态化：实例不保存不可重建的状态（KV Cache 可重算，会话亲和只做性能优化、不做正确性依赖），回收 = 损失一点预热带宽，不损失正确性。</p>
+<p>⑤ 回切：Spot 池恢复后 HPA 自动把流量切回，On-Demand 缩回基线。</p></details></li><li>多轮对话场景，为什么需要会话亲和性？如果不用，最坏情况会怎样？<details class="answer"><summary>参考答案</summary><p>原因：多轮对话第 N 轮的 prompt = 前 N-1 轮全部历史 + 新输入。路由到处理过前几轮的实例，历史部分 KV Cache 直接命中（prefix caching），只需 prefill 新增的一小段；路由到别的实例，整段对话历史要从头 prefill。</p>
+<p>最坏情况：长对话 + 高频轮次场景下雪崩。比如 20 轮对话、累计 10k tokens 历史，每轮随机路由 → 每轮全量 prefill 10k tokens，TTFT 从"几乎为 0"恶化到秒级。更要命的是 prefill 是 compute-bound，大量重复 prefill 吃光集群算力，干扰所有请求的 decode（第 4 章 prefill 干扰 decode 的场景），p99 全面恶化。相当于把每轮 O(新增长度) 的成本放大成 O(对话总长度)，算力和延迟双重付费。</p>
+<p>实现就是基于 session_id 的 consistent hashing。注意它是性能优化而非正确性依赖：实例挂了换一台只是重新 prefill，不丢数据。</p></details></li></ol>
+
+
+<hr>
+<p><em>至此，从单卡优化到集群运维，你已经掌握了 LLM 推理优化的完整知识体系。回顾路线图：<a href="../index.html">README.md</a></em></p><nav class="pager"><a class="pager-card" href="06_framework_ecosystem.html"><span class="pager-dir">← 上一章</span><span class="pager-title">06 · 推理框架生态</span></a></nav>
+  </article>
+  <aside class="toc"><div class="toc-title">本页目录</div><ul class="toc-list"><li class="toc-l1"><a href="#第七章推理集群与基础设施-怎么把模型跑在云上" data-toc-link>第七章：推理集群与基础设施 —— 怎么把模型跑在&quot;云&quot;上？</a><ul class="toc-list"><li class="toc-l2"><a href="#1-gpu-推理集群架构" data-toc-link>1. GPU 推理集群架构</a><ul class="toc-list"><li class="toc-l3"><a href="#11-典型架构" data-toc-link>1.1 典型架构</a></li><li class="toc-l3"><a href="#12-关键组件" data-toc-link>1.2 关键组件</a></li></ul></li><li class="toc-l2"><a href="#2-autoscaling自动伸缩" data-toc-link>2. Autoscaling（自动伸缩）</a><ul class="toc-list"><li class="toc-l3"><a href="#21-为什么需要-autoscaling" data-toc-link>2.1 为什么需要 Autoscaling？</a></li><li class="toc-l3"><a href="#22-autoscaling-的类型" data-toc-link>2.2 Autoscaling 的类型</a><ul class="toc-list"></ul></li><li class="toc-l3"><a href="#23-llm-autoscaling-的特殊挑战" data-toc-link>2.3 LLM Autoscaling 的特殊挑战</a><ul class="toc-list"></ul></li><li class="toc-l3"><a href="#24-预测性扩容predictive-autoscaling" data-toc-link>2.4 预测性扩容（Predictive Autoscaling）</a></li><li class="toc-l3"><a href="#25-优先级与抢占" data-toc-link>2.5 优先级与抢占</a></li></ul></li><li class="toc-l2"><a href="#3-负载均衡与请求路由" data-toc-link>3. 负载均衡与请求路由</a><ul class="toc-list"><li class="toc-l3"><a href="#31-为什么传统-lb-不够" data-toc-link>3.1 为什么传统 LB 不够？</a></li><li class="toc-l3"><a href="#32-感知负载的路由策略" data-toc-link>3.2 感知负载的路由策略</a></li><li class="toc-l3"><a href="#33-会话亲和性session-affinity" data-toc-link>3.3 会话亲和性（Session Affinity）</a></li></ul></li><li class="toc-l2"><a href="#4-gpu-资源管理" data-toc-link>4. GPU 资源管理</a><ul class="toc-list"><li class="toc-l3"><a href="#41-gpu-型号选择" data-toc-link>4.1 GPU 型号选择</a></li><li class="toc-l3"><a href="#42-异构集群mixed-gpu-types" data-toc-link>4.2 异构集群（Mixed GPU Types）</a></li><li class="toc-l3"><a href="#43-mig-multi-instance-gpu" data-toc-link>4.3 MIG (Multi-Instance GPU)</a></li><li class="toc-l3"><a href="#44-gpu-时间片共享time-slicing" data-toc-link>4.4 GPU 时间片共享（Time-Slicing）</a></li><li class="toc-l3"><a href="#45-显存虚拟化unified-memory-cuda-um" data-toc-link>4.5 显存虚拟化（Unified Memory / CUDA UM）</a></li></ul></li><li class="toc-l2"><a href="#5-cpu-推理与混合部署" data-toc-link>5. CPU 推理与混合部署</a><ul class="toc-list"><li class="toc-l3"><a href="#51-什么时候用-cpu" data-toc-link>5.1 什么时候用 CPU？</a></li><li class="toc-l3"><a href="#52-cpu-推理框架" data-toc-link>5.2 CPU 推理框架</a></li><li class="toc-l3"><a href="#53-cpu-gpu-混合推理" data-toc-link>5.3 CPU + GPU 混合推理</a></li></ul></li><li class="toc-l2"><a href="#6-成本优化" data-toc-link>6. 成本优化</a><ul class="toc-list"><li class="toc-l3"><a href="#61-成本构成" data-toc-link>6.1 成本构成</a></li><li class="toc-l3"><a href="#62-省钱策略" data-toc-link>6.2 省钱策略</a><ul class="toc-list"></ul></li></ul></li><li class="toc-l2"><a href="#7-可观测性" data-toc-link>7. 可观测性</a><ul class="toc-list"><li class="toc-l3"><a href="#71-关键监控指标" data-toc-link>7.1 关键监控指标</a></li><li class="toc-l3"><a href="#72-告警策略" data-toc-link>7.2 告警策略</a></li><li class="toc-l3"><a href="#73-分布式追踪" data-toc-link>7.3 分布式追踪</a></li></ul></li><li class="toc-l2"><a href="#8-典型部署方案" data-toc-link>8. 典型部署方案</a><ul class="toc-list"><li class="toc-l3"><a href="#81-小规模创业公司-内部工具" data-toc-link>8.1 小规模（创业公司 / 内部工具）</a></li><li class="toc-l3"><a href="#82-中规模生产服务" data-toc-link>8.2 中规模（生产服务）</a></li><li class="toc-l3"><a href="#83-大规模公有云-llm-服务" data-toc-link>8.3 大规模（公有云 LLM 服务）</a></li></ul></li><li class="toc-l2"><a href="#9-推理平台开源项目" data-toc-link>9. 推理平台开源项目</a></li><li class="toc-l2"><a href="#思考题" data-toc-link>思考题</a></li></ul></li></ul></aside>
+</main>
+<script src="../assets/blog.js?v=1788185626"></script>
+</body>
+</html>

@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>LLM Autoscaling：冷启动与预测式扩容</title>
+<meta name="hyperframes:composition" content="llm-autoscaling">
+<meta name="hyperframes:width" content="1280">
+<meta name="hyperframes:height" content="720">
+<meta name="hyperframes:duration" content="13">
+<meta name="hyperframes:fps" content="30">
+<link rel="stylesheet" href="anim.css">
+<style>
+  .chart-panel { position: absolute; left: 40px; width: 1200px; height: 240px; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; }
+  #panel-reactive { top: 106px; }
+  #panel-predict { top: 386px; }
+  .chart-badge { position: absolute; top: 15px; right: 16px; }
+  .queue-bubble {
+    position: absolute; left: 700px; top: 56px; width: 260px; height: 110px;
+    background: rgba(220,38,38,0.08); border: 2px dashed var(--red); border-radius: 16px;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px;
+    font-size: 13px; font-weight: 650; color: var(--red); transform: scale(0); z-index: 4;
+  }
+  .queue-bubble small { font-size: 11px; font-weight: 500; color: #b91c1c; }
+  .ok-chip {
+    position: absolute; left: 740px; top: 90px; padding: 6px 14px; border-radius: 999px;
+    background: var(--green-bg); border: 1.5px solid #6ee7b7; color: #047857;
+    font-size: 13px; font-weight: 650; opacity: 0; z-index: 4;
+  }
+  .lag-bracket {
+    position: absolute; left: 830px; top: 206px; width: 100px; height: 12px;
+    border: 1.5px dashed var(--amber); border-top: none; opacity: 0;
+  }
+  .lag-lbl { position: absolute; left: 730px; top: 220px; font-size: 11px; color: var(--amber); font-weight: 600; opacity: 0; white-space: nowrap; }
+  .legend { position: absolute; top: 15px; left: 220px; display: flex; gap: 16px; font-size: 11.5px; color: var(--mut); }
+  .legend i { display: inline-block; width: 14px; height: 3px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }
+</style>
+</head>
+<body>
+<div id="root" data-composition-id="llm-autoscaling" data-start="0" data-duration="13" data-width="1280" data-height="720">
+  <header class="hf-head">
+    <div class="hf-head-text">
+      <span class="hf-kicker">Chapter 07 · 集群与基础设施</span>
+      <h1 class="hf-title">LLM Autoscaling：扩容赶不上流量的 5–10 分钟</h1>
+    </div>
+    <span class="hf-chapter">12 / 12</span>
+  </header>
+
+  <div id="scene">
+    <div class="chart-panel" id="panel-reactive">
+      <span class="stage-label">Reactive HPA · 反应式扩容</span>
+      <span class="chart-badge badge badge-red">扩容滞后 → SLO 违约</span>
+      <div class="legend">
+        <span><i style="background:#2563eb;"></i>QPS</span>
+        <span><i style="background:#d97706;"></i>实例数</span>
+        <span><i style="background:#dc2626;"></i>排队积压</span>
+      </div>
+      <svg width="1200" height="240" viewBox="0 0 1200 240" style="position:absolute;left:0;top:0;">
+        <line x1="60" y1="204" x2="1180" y2="204" stroke="#a1a1aa" stroke-width="1.2"/>
+        <g font-family="ui-monospace, Menlo, monospace" font-size="10.5" fill="#a1a1aa">
+          <text x="60" y="218">00:00</text><text x="340" y="218">06:00</text><text x="620" y="218">12:00</text><text x="900" y="218">18:00</text><text x="1150" y="218">24:00</text>
+        </g>
+        <path id="traffic-r" d="M 60 184 C 280 184, 480 179, 600 164 C 680 154, 720 114, 760 74 C 790 54, 810 59, 830 69 C 880 89, 940 134, 1020 154 C 1080 166, 1140 179, 1180 182" fill="none" stroke="#2563eb" stroke-width="3" stroke-linecap="round"/>
+        <path id="replica-r" d="M 60 179 L 830 179 L 830 124 L 930 124 L 930 89 L 1180 89" fill="none" stroke="#d97706" stroke-width="3" stroke-linecap="round"/>
+      </svg>
+      <div class="queue-bubble" id="queue-r">
+        排队积压 · TTFT 飙升
+        <small>扩容触发 → 实例就绪：5–10 min</small>
+        <small>申请节点 → 拉镜像 → 加载权重</small>
+      </div>
+      <div class="lag-bracket" id="bracket-r"></div>
+      <span class="lag-lbl" id="lag-lbl-r">就绪延迟</span>
+    </div>
+
+    <div class="chart-panel" id="panel-predict">
+      <span class="stage-label">Predictive + HPA · 预测式扩容</span>
+      <span class="chart-badge badge badge-green">提前就位 → 平稳</span>
+      <div class="legend">
+        <span><i style="background:#2563eb;"></i>QPS</span>
+        <span><i style="background:#d97706;"></i>实例数</span>
+      </div>
+      <svg width="1200" height="240" viewBox="0 0 1200 240" style="position:absolute;left:0;top:0;">
+        <line x1="60" y1="204" x2="1180" y2="204" stroke="#a1a1aa" stroke-width="1.2"/>
+        <g font-family="ui-monospace, Menlo, monospace" font-size="10.5" fill="#a1a1aa">
+          <text x="60" y="218">00:00</text><text x="340" y="218">06:00</text><text x="620" y="218">12:00</text><text x="900" y="218">18:00</text><text x="1150" y="218">24:00</text>
+        </g>
+        <path id="traffic-p" d="M 60 184 C 280 184, 480 179, 600 164 C 680 154, 720 114, 760 74 C 790 54, 810 59, 830 69 C 880 89, 940 134, 1020 154 C 1080 166, 1140 179, 1180 182" fill="none" stroke="#2563eb" stroke-width="3" stroke-linecap="round"/>
+        <path id="replica-p" d="M 60 179 L 580 179 L 580 124 L 680 124 L 680 89 L 1180 89" fill="none" stroke="#d97706" stroke-width="3" stroke-linecap="round"/>
+      </svg>
+      <div class="ok-chip" id="ok-p">✓ 流量到达时实例已就绪</div>
+    </div>
+  </div>
+
+  <footer class="hf-caption"><span class="cap-dot"></span><span id="cap-text"></span></footer>
+</div>
+<script src="gsap.min.js"></script>
+<script>
+(function () {
+  var tl = gsap.timeline({ paused: true, defaults: { ease: "power2.inOut" } });
+  var cap = function (t, text) { tl.set("#cap-text", { textContent: text }, t); };
+  function prep(pathId) {
+    var p = document.getElementById(pathId);
+    var L = p.getTotalLength();
+    gsap.set(p, { strokeDasharray: L, strokeDashoffset: L });
+    return L;
+  }
+  ["traffic-r", "replica-r", "traffic-p", "replica-p"].forEach(prep);
+
+  cap(0, "LLM 流量：日周期 + 突发尖峰 —— 实例数必须跟着走，但 GPU 不是即开即用的");
+  tl.fromTo("#panel-reactive", { autoAlpha: 0, y: 16 }, { autoAlpha: 1, y: 0, duration: 0.5 }, 0.2);
+  tl.fromTo("#panel-predict", { autoAlpha: 0, y: 16 }, { autoAlpha: 1, y: 0, duration: 0.5 }, 0.35);
+
+  cap(1.2, "反应式 HPA：指标超阈值 → 触发扩容 → 但新实例就绪要 5–10 分钟");
+  tl.to("#traffic-r", { strokeDashoffset: 0, duration: 1.6, ease: "power1.inOut" }, 1.2);
+  tl.to("#replica-r", { strokeDashoffset: 0, duration: 1.6, ease: "power1.inOut" }, 2.4);
+
+  cap(3.6, "流量尖峰已经到达，实例还在启动 —— 这段时间全部转化为排队与延迟");
+  tl.to("#queue-r", { scale: 1, duration: 0.6, ease: "back.out(1.6)" }, 3.8);
+  tl.to("#bracket-r, #lag-lbl-r", { opacity: 1, duration: 0.4 }, 4.2);
+  cap(5.4, "反应式的宿命：扩容永远滞后于流量 —— 等实例就绪，高峰已过一半");
+  tl.to("#queue-r", { scale: 0.6, opacity: 0.5, duration: 0.6 }, 5.6);
+
+  cap(6.6, "预测式扩容：用历史流量模式，提前 10 分钟把实例备好");
+  tl.to("#traffic-p", { strokeDashoffset: 0, duration: 1.6, ease: "power1.inOut" }, 6.6);
+  tl.to("#replica-p", { strokeDashoffset: 0, duration: 1.6, ease: "power1.inOut" }, 7.2);
+  tl.to("#ok-p", { opacity: 1, duration: 0.4 }, 8.8);
+  cap(9.2, "流量到达时容量已就位 —— 预测做基线，HPA 做微调，缩容要慢（5–10 min 稳定窗）");
+
+  cap(10.8, "GPU 很贵：不能不扩（SLO 违约），也不能多扩（凌晨闲置浪费 80%+）—— 这就是集群侧的核心权衡");
+  tl.to("#scene", { autoAlpha: 0, duration: 0.5 }, 12.4);
+
+  window.__timelines = window.__timelines || {};
+  window.__timelines["llm-autoscaling"] = tl;
+  if (new URLSearchParams(location.search).has("autoplay")) { tl.repeat(-1).play(); }
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Speculative Decoding：猜 + 验证</title>
+<meta name="hyperframes:composition" content="speculative-decoding">
+<meta name="hyperframes:width" content="1280">
+<meta name="hyperframes:height" content="720">
+<meta name="hyperframes:duration" content="13">
+<meta name="hyperframes:fps" content="30">
+<link rel="stylesheet" href="anim.css">
+<style>
+  .lane { width: 1200px; left: 40px; }
+  #lane-serial { top: 106px; height: 200px; }
+  #lane-spec { top: 346px; height: 296px; }
+  .lane-badge { position: absolute; top: 15px; right: 16px; }
+  .fwd-count { position: absolute; top: 60px; right: 24px; text-align: right; }
+  .fwd-num { font-family: var(--mono); font-size: 34px; font-weight: 650; }
+  .tok-slot { position: absolute; top: 100px; opacity: 0; }
+  .fwd-tick { position: absolute; top: 146px; font-family: var(--mono); font-size: 10.5px; color: var(--faint); opacity: 0; }
+  .time-track { position: absolute; top: 176px; left: 20px; width: 760px; height: 10px; }
+  .time-lbl { position: absolute; top: 158px; left: 20px; font-size: 11.5px; color: var(--mut); }
+  .model-box { position: absolute; border-radius: 12px; border: 1.5px solid; background: #fff; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; }
+  #box-draft { left: 30px; top: 60px; width: 240px; height: 84px; border-color: #93c5fd; }
+  #box-target { left: 480px; top: 60px; width: 320px; height: 84px; border-color: #a1a1aa; }
+  .model-name { font-family: var(--mono); font-size: 13.5px; font-weight: 650; }
+  .model-sub { font-size: 11.5px; color: var(--mut); }
+  .draft-tok { position: absolute; top: 180px; opacity: 0; }
+  .verdict { position: absolute; top: 148px; font-size: 15px; font-weight: 700; opacity: 0; }
+  #sp-corr { position: absolute; top: 180px; left: 606px; opacity: 0; }
+  .sp-stat { position: absolute; right: 24px; text-align: right; }
+  .sp-num { font-family: var(--mono); font-size: 30px; font-weight: 650; color: var(--green); }
+</style>
+</head>
+<body>
+<div id="root" data-composition-id="speculative-decoding" data-start="0" data-duration="13" data-width="1280" data-height="720">
+  <header class="hf-head">
+    <div class="hf-head-text">
+      <span class="hf-kicker">Chapter 05 · 进阶优化技术</span>
+      <h1 class="hf-title">Speculative Decoding：小模型猜，大模型验</h1>
+    </div>
+    <span class="hf-chapter">10 / 12</span>
+  </header>
+
+  <div id="scene">
+    <div class="panel lane" id="lane-serial">
+      <span class="stage-label">串行 Decode · 一 token 一次前向</span>
+      <span class="lane-badge badge badge-red">5 tokens = 5 次前向</span>
+      <div class="chip tok-slot" id="sr-t0" style="left:20px;">的</div>
+      <div class="chip tok-slot" id="sr-t1" style="left:172px;">一</div>
+      <div class="chip tok-slot" id="sr-t2" style="left:324px;">天</div>
+      <div class="chip tok-slot" id="sr-t3" style="left:476px;">真</div>
+      <div class="chip tok-slot" id="sr-t4" style="left:628px;">好</div>
+      <span class="fwd-tick" style="left:14px;" id="sr-k0">1 次前向 ↓</span>
+      <span class="fwd-tick" style="left:166px;" id="sr-k1">1 次前向 ↓</span>
+      <span class="fwd-tick" style="left:318px;" id="sr-k2">1 次前向 ↓</span>
+      <span class="fwd-tick" style="left:470px;" id="sr-k3">1 次前向 ↓</span>
+      <span class="fwd-tick" style="left:622px;" id="sr-k4">1 次前向 ↓</span>
+      <div class="fwd-count">
+        <div class="label">前向传播</div>
+        <div class="fwd-num" style="color:var(--red);" id="sr-count">0 次</div>
+      </div>
+      <span class="time-lbl">耗时</span>
+      <div class="bar-track time-track"><div class="bar-fill bar-red" id="sr-bar"></div></div>
+    </div>
+
+    <div class="panel lane" id="lane-spec">
+      <span class="stage-label">Speculative Decoding · 猜 γ=4，一次验证</span>
+      <span class="lane-badge badge badge-green">实测 2–3× 加速</span>
+      <div class="model-box" id="box-draft">
+        <span class="model-name" style="color:var(--blue);">Draft 小模型</span>
+        <span class="model-sub">串行猜 4 个 · 每步极快</span>
+      </div>
+      <div class="model-box" id="box-target">
+        <span class="model-name">Target 大模型</span>
+        <span class="model-sub">1 次前向 · 4 个位置并行验证</span>
+      </div>
+      <div class="chip chip-blue draft-tok" id="sp-d0" style="left:354px;">的</div>
+      <div class="chip chip-blue draft-tok" id="sp-d1" style="left:438px;">一</div>
+      <div class="chip chip-blue draft-tok" id="sp-d2" style="left:522px;">天</div>
+      <div class="chip chip-blue draft-tok" id="sp-d3" style="left:606px;">吗</div>
+      <span class="verdict" style="left:368px;color:var(--green);" id="v0">✓</span>
+      <span class="verdict" style="left:452px;color:var(--green);" id="v1">✓</span>
+      <span class="verdict" style="left:536px;color:var(--green);" id="v2">✓</span>
+      <span class="verdict" style="left:620px;color:var(--red);" id="v3">✗</span>
+      <div class="chip chip-green" id="sp-corr">真</div>
+      <div class="sp-stat" style="top:60px;">
+        <div class="label">本轮产出</div>
+        <div class="sp-num" id="sp-out">0</div>
+      </div>
+      <div class="sp-stat" style="top:150px;">
+        <div class="label">大模型前向</div>
+        <div class="sp-num" style="color:var(--ink);" id="sp-fwd">0 次</div>
+      </div>
+      <span class="time-lbl" style="top:236px;">耗时对比</span>
+      <div class="bar-track" style="top:256px;left:20px;width:760px;height:10px;"><div class="bar-fill bar-green" id="sp-bar"></div></div>
+      <span class="note" id="sp-note" style="left:800px;top:238px;width:380px;opacity:0;">接受最长连续前缀（的 一 天）+ target 顺手产出修正 token（真）→ 一轮 4 个</span>
+    </div>
+  </div>
+
+  <footer class="hf-caption"><span class="cap-dot"></span><span id="cap-text"></span></footer>
+</div>
+<script src="gsap.min.js"></script>
+<script>
+(function () {
+  var tl = gsap.timeline({ paused: true, defaults: { ease: "power2.inOut" } });
+  var cap = function (t, text) { tl.set("#cap-text", { textContent: text }, t); };
+
+  cap(0, "Decode 是串行的：下一步必须等上一步 —— GPU 算力再富余也只能空等");
+  tl.fromTo("#lane-serial", { autoAlpha: 0, y: 16 }, { autoAlpha: 1, y: 0, duration: 0.5 }, 0.2);
+  tl.fromTo("#lane-spec", { autoAlpha: 0, y: 16 }, { autoAlpha: 1, y: 0, duration: 0.5 }, 0.35);
+
+  // 串行：5 个 token 逐个来
+  cap(1.2, "串行生成 5 个 token = 5 次完整前向传播");
+  var srTok = ["的", "一", "天", "真", "好"];
+  for (var i = 0; i < 5; i++) {
+    (function (i) {
+      var t = 1.3 + i * 0.75;
+      tl.fromTo("#sr-t" + i, { autoAlpha: 0, scale: 0.5 }, { autoAlpha: 1, scale: 1, duration: 0.3, ease: "back.out(2)" }, t);
+      tl.to("#sr-k" + i, { opacity: 1, duration: 0.2 }, t + 0.3);
+      tl.set("#sr-count", { textContent: (i + 1) + " 次" }, t + 0.35);
+      tl.to("#sr-bar", { width: (i + 1) * 20 + "%", duration: 0.3 }, t + 0.35);
+    })(i);
+  }
+  cap(5.2, "每个 token 都要完整读一遍权重 —— 慢就慢在这里");
+
+  // 投机：draft 快速猜 4 个
+  cap(6.2, "投机解码：先让小模型串行「猜」γ=4 个 token（小模型每步极快）");
+  for (var j = 0; j < 4; j++) {
+    tl.fromTo("#sp-d" + j, { autoAlpha: 0, x: -30 }, { autoAlpha: 1, x: 0, duration: 0.22, ease: "power2.out" }, 6.4 + j * 0.22);
+  }
+  tl.fromTo("#box-draft", { borderColor: "#93c5fd" }, { borderColor: "#2563eb", duration: 0.2, yoyo: true, repeat: 3 }, 6.4);
+
+  // target 一次并行验证
+  cap(7.6, "大模型把 4 个猜测拼进序列，用 1 次前向传播并行验证所有位置");
+  tl.fromTo("#box-target", { borderColor: "#a1a1aa" }, { borderColor: "#18181b", duration: 0.25, yoyo: true, repeat: 1 }, 7.8);
+  tl.to(".draft-tok", { scale: 1.15, duration: 0.25, yoyo: true, repeat: 1 }, 7.9);
+  tl.set("#sp-fwd", { textContent: "1 次" }, 8.3);
+
+  // 判定
+  cap(8.8, "逐位比对：接受最长连续前缀，从第一个分叉点截断");
+  tl.to("#v0", { opacity: 1, duration: 0.2 }, 8.8);
+  tl.set("#sp-d0", { backgroundColor: "#ecfdf5", borderColor: "#6ee7b7", color: "#047857" }, 8.8);
+  tl.to("#v1", { opacity: 1, duration: 0.2 }, 9.15);
+  tl.set("#sp-d1", { backgroundColor: "#ecfdf5", borderColor: "#6ee7b7", color: "#047857" }, 9.15);
+  tl.to("#v2", { opacity: 1, duration: 0.2 }, 9.5);
+  tl.set("#sp-d2", { backgroundColor: "#ecfdf5", borderColor: "#6ee7b7", color: "#047857" }, 9.5);
+  tl.to("#v3", { opacity: 1, duration: 0.2 }, 9.85);
+  tl.set("#sp-d3", { backgroundColor: "#fef2f2", borderColor: "#fca5a5", color: "#b91c1c" }, 9.85);
+  cap(10.3, "被拒绝的位置由 target 顺手产出修正 token —— 一轮净得 4 个 token");
+  tl.fromTo("#sp-corr", { autoAlpha: 0, scale: 0.4 }, { autoAlpha: 1, scale: 1, duration: 0.35, ease: "back.out(2.2)" }, 10.3);
+  tl.set("#sp-out", { textContent: "4" }, 10.6);
+  tl.to("#sp-bar", { width: "45%", duration: 0.6, ease: "power2.out" }, 10.6);
+  tl.to("#sp-note", { opacity: 1, duration: 0.4 }, 10.8);
+  cap(11.6, "接受率 α 越高、draft 越快，加速比越接近 γ+1 倍 —— 5 步串行变 ~2 步");
+  tl.to("#scene", { autoAlpha: 0, duration: 0.5 }, 12.5);
+
+  window.__timelines = window.__timelines || {};
+  window.__timelines["speculative-decoding"] = tl;
+  if (new URLSearchParams(location.search).has("autoplay")) { tl.repeat(-1).play(); }
+})();
+</script>
+</body>
+</html>

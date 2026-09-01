@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>均匀量化：FP32 → INT8 的线性映射</title>
+<meta name="hyperframes:composition" content="uniform-quantization">
+<meta name="hyperframes:width" content="1280">
+<meta name="hyperframes:height" content="720">
+<meta name="hyperframes:duration" content="12.5">
+<meta name="hyperframes:fps" content="30">
+<link rel="stylesheet" href="anim.css">
+<style>
+  #zone-map { position: absolute; left: 40px; top: 106px; width: 700px; height: 452px; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; }
+  #zone-side { position: absolute; left: 760px; top: 106px; width: 480px; height: 452px; display: flex; flex-direction: column; gap: 12px; }
+  .axis-line { position: absolute; left: 80px; top: 113px; width: 600px; height: 2px; background: #a1a1aa; }
+  .grid-line { position: absolute; left: 80px; top: 233px; width: 600px; height: 2px; background: #d4d4d8; }
+  .axis-tick { position: absolute; top: 108px; width: 2px; height: 12px; background: #a1a1aa; }
+  .gtick { position: absolute; top: 226px; width: 2px; height: 16px; background: #c4b5fd; }
+  .absmax-line { position: absolute; top: 78px; width: 0; height: 190px; border-left: 2px dashed var(--red); opacity: 0; }
+  .wdot { position: absolute; width: 14px; height: 14px; border-radius: 50%; background: var(--blue); border: 2px solid #fff; box-shadow: 0 1px 4px rgba(0,0,0,.25); z-index: 3; }
+  .wghost { position: absolute; width: 14px; height: 14px; border-radius: 50%; background: #d4d4d8; opacity: 0; z-index: 2; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 13px 16px; }
+  .fline { font-family: var(--mono); font-size: 14px; color: var(--ink); padding: 3px 0; opacity: 0; }
+  .ro-row { display: flex; justify-content: space-between; font-size: 12.5px; color: var(--mut); padding: 2.5px 0; }
+  .ro-row b { font-family: var(--mono); font-size: 13px; color: var(--ink); }
+</style>
+</head>
+<body>
+<div id="root" data-composition-id="uniform-quantization" data-start="0" data-duration="12.5" data-width="1280" data-height="720">
+  <header class="hf-head">
+    <div class="hf-head-text">
+      <span class="hf-kicker">Chapter 03 · 量化</span>
+      <h1 class="hf-title">均匀量化：FP32 → INT8 的线性映射</h1>
+    </div>
+    <span class="hf-chapter">07 / 12</span>
+  </header>
+
+  <div id="scene">
+    <div id="zone-map">
+      <span class="zone-title" style="top:13px;left:16px;position:absolute;font-size:13.5px;font-weight:650;">权重分布与映射（16 格点放大示意）</span>
+      <span class="label" style="position:absolute;top:88px;left:20px;">FP32 连续值</span>
+      <span class="label" style="position:absolute;top:208px;left:20px;">INT8 格点</span>
+      <div class="axis-line"></div>
+      <div class="grid-line"></div>
+      <div class="absmax-line" id="absmax-l" style="left:140px;"></div>
+      <div class="absmax-line" id="absmax-r" style="left:620px;"></div>
+      <span class="tick-label" style="position:absolute;left:118px;top:58px;color:var(--red);">−absmax</span>
+      <span class="tick-label" style="position:absolute;left:600px;top:58px;color:var(--red);">+absmax</span>
+      <span class="tick-label" style="position:absolute;left:64px;top:122px;">−4</span>
+      <span class="tick-label" style="position:absolute;left:364px;top:122px;">0</span>
+      <span class="tick-label" style="position:absolute;left:662px;top:122px;">+4</span>
+      <span class="tick-label" style="position:absolute;left:66px;top:248px;">−127</span>
+      <span class="tick-label" style="position:absolute;left:656px;top:248px;">+127</span>
+      <p class="note" style="left:20px;top:292px;width:660px;" id="map-note">实际 INT8 有 256 个格点，误差 ≤ s/2；图中放大为 16 格点，让四舍五入的误差肉眼可见</p>
+      <p class="note" style="left:20px;top:336px;width:660px;color:var(--red);opacity:0;" id="clip-note">3.90 超出 absmax=3.2 → 被压到边界（clipping），误差 0.70 最大</p>
+    </div>
+    <div id="zone-side">
+      <div class="card">
+        <div class="label" style="margin-bottom:6px;">映射公式</div>
+        <div class="fline" id="f1">s = absmax ÷ 127 ≈ 0.025</div>
+        <div class="fline" id="f2">x_q = round(x ÷ s) · 量化</div>
+        <div class="fline" id="f3">x̂ = x_q × s · 反量化</div>
+      </div>
+      <div class="card" id="ro-card" style="opacity:0;">
+        <div class="label" style="margin-bottom:6px;">单个权重的往返（x = 1.40）</div>
+        <div class="ro-row"><span>原始值 x</span><b>1.40</b></div>
+        <div class="ro-row"><span>量化后 x_q</span><b id="ro-xq">—</b></div>
+        <div class="ro-row"><span>反量化 x̂</span><b id="ro-xh">—</b></div>
+        <div class="ro-row"><span>误差 |x̂ − x|</span><b id="ro-err" style="color:var(--amber);">—</b></div>
+      </div>
+      <div class="card" style="opacity:0;" id="summary-card">
+        <div class="label" style="margin-bottom:6px;">工程取舍</div>
+        <p style="font-size:12.5px;color:var(--ink2);line-height:1.6;">粒度越细（per-channel / per-group），scale 越合身，误差越小；AWQ 会专门保护少数大幅值权重。</p>
+      </div>
+    </div>
+  </div>
+
+  <footer class="hf-caption"><span class="cap-dot"></span><span id="cap-text"></span></footer>
+</div>
+<script src="gsap.min.js"></script>
+<script>
+(function () {
+  // FP32 轴：[-4,4] → x ∈ [80,680]；格点行：[-3.2,3.2] → 16 格点 x = 80 + k*40
+  var vals = [-3.0, -2.4, -1.7, -1.1, -0.5, 0.2, 0.8, 1.4, 2.1, 2.9];
+  var outlier = 3.9;
+  var s16 = 6.4 / 15; // 16 格点示意的步长
+  function axisX(v) { return 80 + (v + 4) / 8 * 600; }
+  function gridK(v) {
+    var k = Math.round((v + 3.2) / s16);
+    return Math.max(0, Math.min(15, k));
+  }
+  function gridVal(k) { return -3.2 + k * s16; }
+
+  var zone = document.getElementById("zone-map");
+  // 格点 tick
+  for (var k = 0; k < 16; k++) {
+    var t = document.createElement("div");
+    t.className = "gtick";
+    t.style.left = 80 + k * 40 - 1 + "px";
+    zone.appendChild(t);
+  }
+  // 权重点（原始 + 残影）
+  var dots = [];
+  var all = vals.concat([outlier]);
+  all.forEach(function (v, i) {
+    var ghost = document.createElement("div");
+    ghost.className = "wghost";
+    ghost.style.left = axisX(v) - 7 + "px";
+    ghost.style.top = "106px";
+    zone.appendChild(ghost);
+    var d = document.createElement("div");
+    d.className = "wdot";
+    d.id = "wd" + i;
+    if (i === all.length - 1) d.style.background = "var(--red)";
+    d.style.left = axisX(v) - 7 + "px";
+    d.style.top = "106px";
+    zone.appendChild(d);
+    dots.push({ el: d, ghost: ghost, v: v, x0: axisX(v) - 7 });
+  });
+
+  var tl = gsap.timeline({ paused: true, defaults: { ease: "power2.inOut" } });
+  var cap = function (t, text) { tl.set("#cap-text", { textContent: text }, t); };
+
+  cap(0, "量化：用有限个整数格点，近似一串连续 FP32 权重");
+  tl.fromTo("#zone-map, #zone-side", { autoAlpha: 0, y: 16 }, { autoAlpha: 1, y: 0, duration: 0.5 }, 0.2);
+  tl.fromTo(".wdot", { autoAlpha: 0, scale: 0 }, { autoAlpha: 1, scale: 1, duration: 0.3, stagger: 0.06, ease: "back.out(2)" }, 0.6);
+
+  cap(1.8, "第一步：找 absmax —— 绝对值最大的权重决定 scale（超出它就被截断）");
+  tl.to("#absmax-l, #absmax-r", { opacity: 1, duration: 0.4 }, 1.8);
+  tl.to("#f1", { opacity: 1, duration: 0.4 }, 2.4);
+  tl.to("#f2", { opacity: 1, duration: 0.4 }, 2.8);
+  tl.to("#f3", { opacity: 1, duration: 0.4 }, 3.2);
+
+  cap(3.8, "x_q = round(x ÷ s)：每个权重四舍五入「落」到最近的格点上");
+  tl.fromTo(".gtick", { autoAlpha: 0 }, { autoAlpha: 1, duration: 0.3, stagger: 0.02 }, 3.6);
+  dots.forEach(function (d, i) {
+    var k = gridK(d.v);
+    var targetX = 80 + k * 40 - 7;
+    var t = 4.2 + i * 0.16;
+    tl.to(d.ghost, { opacity: 0.4, duration: 0.2 }, t);
+    tl.to(d.el, { x: targetX - d.x0, y: 120, duration: 0.45, ease: "power2.in" }, t);
+    if (i === 7) { // x=1.4 的例子
+      tl.set("#ro-xq", { textContent: "round(1.40/s) → " + k }, t + 0.45);
+    }
+  });
+  tl.to("#ro-card", { opacity: 1, duration: 0.4 }, 5.0);
+
+  cap(6.4, "3.90 > absmax：直接 clamp 到边界格点 —— clipping 误差最大");
+  var dx = dots[dots.length - 1];
+  tl.to(dx.el, { scale: 1.6, duration: 0.3, yoyo: true, repeat: 1 }, 6.4);
+  tl.to("#clip-note", { opacity: 1, duration: 0.4 }, 6.8);
+
+  cap(8.2, "反量化 x̂ = x_q × s 回到浮点轴：位置微微偏移 —— 这就是量化误差");
+  dots.forEach(function (d, i) {
+    var k = gridK(d.v);
+    var xh = gridVal(k);
+    var backX = axisX(xh) - 7;
+    var t = 8.2 + i * 0.12;
+    tl.to(d.el, { x: backX - d.x0, y: 0, duration: 0.45, ease: "power2.out" }, t);
+    tl.to(d.ghost, { opacity: 0, duration: 0.3 }, t);
+    if (i === 7) {
+      tl.set("#ro-xh", { textContent: "≈ " + xh.toFixed(2) }, t + 0.45);
+      tl.set("#ro-err", { textContent: "≈ " + Math.abs(xh - d.v).toFixed(2) }, t + 0.45);
+    }
+  });
+  cap(10.2, "粒度越细（per-channel / per-group），scale 越合身，误差越小");
+  tl.to("#summary-card", { opacity: 1, duration: 0.4 }, 10.2);
+  cap(11.5, "省一半到四分之三的显存读取 —— 这正是 memory-bound 场景最需要的");
+  tl.to("#scene", { autoAlpha: 0, duration: 0.5 }, 12.0);
+
+  window.__timelines = window.__timelines || {};
+  window.__timelines["uniform-quantization"] = tl;
+  if (new URLSearchParams(location.search).has("autoplay")) { tl.repeat(-1).play(); }
+})();
+</script>
+</body>
+</html>

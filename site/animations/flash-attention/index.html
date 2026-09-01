@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>FlashAttention：Tiling + Online Softmax</title>
+<meta name="hyperframes:composition" content="flash-attention">
+<meta name="hyperframes:width" content="1280">
+<meta name="hyperframes:height" content="720">
+<meta name="hyperframes:duration" content="14">
+<meta name="hyperframes:fps" content="30">
+<link rel="stylesheet" href="anim.css">
+<style>
+  #zone-std { position: absolute; left: 40px; top: 106px; width: 380px; height: 452px; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; }
+  #zone-fa { position: absolute; left: 460px; top: 106px; width: 780px; height: 452px; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; }
+  .mx-cell { position: absolute; width: 34px; height: 34px; border-radius: 6px; background: var(--red-bg); border: 1px solid #fca5a5; opacity: 0; }
+  .std-hbm { position: absolute; left: 24px; top: 386px; width: 332px; height: 42px; background: #fff; border: 1.5px solid var(--line); border-radius: 10px; display: flex; align-items: center; justify-content: center; font-family: var(--mono); font-size: 12px; color: var(--ink2); }
+  .std-arrow { position: absolute; font-family: var(--mono); font-size: 11px; color: var(--red); opacity: 0; }
+  .fa-hbm { position: absolute; left: 40px; top: 44px; width: 700px; height: 44px; background: #fff; border: 1.5px solid var(--line); border-radius: 10px; display: flex; align-items: center; justify-content: center; gap: 18px; font-family: var(--mono); font-size: 12px; color: var(--ink2); }
+  #sram { position: absolute; left: 40px; top: 130px; width: 460px; height: 280px; background: var(--amber-bg); border: 2px solid #fcd34d; border-radius: 14px; }
+  .tile { position: absolute; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-family: var(--mono); font-size: 11.5px; font-weight: 650; border: 1.5px solid; }
+  #q-tile { left: 190px; top: 56px; width: 120px; height: 44px; background: var(--blue-bg); border-color: #93c5fd; color: #1d4ed8; }
+  .kv-tile { left: 30px; width: 100px; height: 44px; background: var(--violet-bg); border-color: #c4b5fd; color: #6d28d9; opacity: 0; }
+  #k-tile { top: 56px; }
+  #v-tile { top: 116px; }
+  #sij { left: 190px; top: 160px; width: 120px; height: 44px; background: #fff; border-color: #fcd34d; color: #b45309; opacity: 0; }
+  .acc-card { position: absolute; left: 520px; width: 220px; height: 62px; background: #fff; border: 1.5px solid var(--line); border-radius: 10px; padding: 8px 12px; }
+  .acc-name { font-family: var(--mono); font-size: 11.5px; color: var(--mut); }
+  .acc-val { font-family: var(--mono); font-size: 16px; font-weight: 650; color: var(--ink); }
+  .io-badge { position: absolute; font-family: var(--mono); font-size: 12px; font-weight: 650; }
+</style>
+</head>
+<body>
+<div id="root" data-composition-id="flash-attention" data-start="0" data-duration="14" data-width="1280" data-height="720">
+  <header class="hf-head">
+    <div class="hf-head-text">
+      <span class="hf-kicker">Chapter 05 · 进阶优化技术</span>
+      <h1 class="hf-title">FlashAttention：不把 N² 矩阵写进 HBM</h1>
+    </div>
+    <span class="hf-chapter">11 / 12</span>
+  </header>
+
+  <div id="scene">
+    <div id="zone-std">
+      <span class="zone-title" style="top:13px;left:16px;position:absolute;font-size:13.5px;font-weight:650;">标准 Attention · N=8 示意</span>
+      <div id="std-matrix"></div>
+      <span class="std-arrow" id="sa-1" style="left:60px;top:352px;">① 写 S ↓</span>
+      <span class="std-arrow" id="sa-2" style="left:150px;top:352px;">② 读写 P ↓</span>
+      <span class="std-arrow" id="sa-3" style="left:255px;top:352px;">③ 读 P ↓</span>
+      <div class="std-hbm">HBM · 往返搬运 O(N²) 数据</div>
+      <span class="io-badge" id="std-io" style="left:24px;top:436px;color:var(--red);opacity:0;">HBM 读写：O(N²)</span>
+    </div>
+
+    <div id="zone-fa">
+      <span class="zone-title" style="top:13px;left:16px;position:absolute;font-size:13.5px;font-weight:650;">FlashAttention · 分块 + 在线归并</span>
+      <div class="fa-hbm"><span>Q</span><span>K（分块 K₁..K₄）</span><span>V（分块 V₁..V₄）</span><span style="color:var(--faint);">存放在 HBM</span></div>
+      <div id="sram">
+        <span class="label" style="position:absolute;top:10px;left:14px;color:#b45309;">片上 SRAM · 小而快</span>
+        <div class="tile" id="q-tile">Q_i 块（常驻）</div>
+        <div class="tile kv-tile" id="k-tile">K_j</div>
+        <div class="tile kv-tile" id="v-tile">V_j</div>
+        <div class="tile" id="sij">S_ij 局部结果</div>
+        <span class="note" style="left:14px;top:236px;width:430px;">局部 S 算完即弃 —— 从不落 HBM，用 m / l 校正归并进 O_i</span>
+      </div>
+      <div class="acc-card" style="top:130px;">
+        <div class="acc-name">m · running max</div>
+        <div class="acc-val" id="fa-m">—</div>
+      </div>
+      <div class="acc-card" style="top:204px;">
+        <div class="acc-name">l · running sum</div>
+        <div class="acc-val" id="fa-l">—</div>
+      </div>
+      <div class="acc-card" style="top:278px;">
+        <div class="acc-name">O_i · 累积输出（rescale 更新）</div>
+        <div class="acc-val" id="fa-o">—</div>
+      </div>
+      <span class="io-badge" id="fa-io" style="left:520px;top:362px;color:var(--green);opacity:0;">HBM 读写：O(N) · 只写回 O</span>
+      <span class="label" id="fa-loop" style="position:absolute;left:40px;top:424px;color:var(--violet);">outer loop：j = 1 / 4</span>
+    </div>
+  </div>
+
+  <footer class="hf-caption"><span class="cap-dot"></span><span id="cap-text"></span></footer>
+</div>
+<script src="gsap.min.js"></script>
+<script>
+(function () {
+  // 左侧 N×N 矩阵（8x8）
+  var mx = document.getElementById("std-matrix");
+  for (var i = 0; i < 64; i++) {
+    var c = document.createElement("div");
+    c.className = "mx-cell";
+    c.style.left = 24 + (i % 8) * 38 + "px";
+    c.style.top = 50 + Math.floor(i / 8) * 38 + "px";
+    mx.appendChild(c);
+  }
+
+  var tl = gsap.timeline({ paused: true, defaults: { ease: "power2.inOut" } });
+  var cap = function (t, text) { tl.set("#cap-text", { textContent: text }, t); };
+
+  cap(0, "标准 Attention：S = QKᵀ 和 P = softmax(S) 都是 N×N —— 序列一长就爆显存");
+  tl.fromTo("#zone-std, #zone-fa", { autoAlpha: 0, y: 16 }, { autoAlpha: 1, y: 0, duration: 0.5 }, 0.2);
+  tl.fromTo(".mx-cell", { autoAlpha: 0, scale: 0.5 }, { autoAlpha: 1, scale: 1, duration: 0.2, stagger: { each: 0.008, from: "start" } }, 0.6);
+  cap(1.8, "S 写 HBM → 读出做 softmax → 写回 P → 再读出乘 V：反复往返搬运");
+  tl.to("#sa-1", { opacity: 1, duration: 0.3 }, 1.8);
+  tl.to("#sa-2", { opacity: 1, duration: 0.3 }, 2.3);
+  tl.to("#sa-3", { opacity: 1, duration: 0.3 }, 2.8);
+  tl.to("#std-io", { opacity: 1, duration: 0.3 }, 3.1);
+
+  cap(3.6, "FlashAttention 的关键洞察：不需要完整的 S，只需要最终的 O");
+  tl.fromTo("#q-tile", { autoAlpha: 0, scale: 0.6 }, { autoAlpha: 1, scale: 1, duration: 0.4, ease: "back.out(2)" }, 3.8);
+
+  // outer loop j = 1..4
+  var loopData = [
+    { t: 4.6, m: "2.1", l: "3.4", o: "O⁽¹⁾", cap: "outer loop：每次把一对 K_j / V_j 块从 HBM 搬进 SRAM" },
+    { t: 6.6, m: "2.8", l: "8.9", o: "O⁽²⁾ rescale", cap: "online softmax：维护 running max m 与 running sum l，边算边归并" },
+    { t: 8.6, m: "2.8", l: "15.2", o: "O⁽³⁾ rescale", cap: "新块到来：用校正因子 e^(m_old−m_new)  rescale 已累积的 O" },
+    { t: 10.6, m: "4.1", l: "21.7", o: "O⁽⁴⁾ 完成", cap: "循环结束：只把最终的 O 写回 HBM —— 访存量 O(N²) → O(N)" }
+  ];
+  loopData.forEach(function (s, j) {
+    tl.set("#fa-loop", { textContent: "outer loop：j = " + (j + 1) + " / 4" }, s.t);
+    cap(s.t, s.cap);
+    // K/V 块飞入 SRAM
+    tl.fromTo("#k-tile", { autoAlpha: 0, x: 120, y: -60 }, { autoAlpha: 1, x: 0, y: 0, duration: 0.45, ease: "power2.out" }, s.t);
+    tl.fromTo("#v-tile", { autoAlpha: 0, x: 120, y: -60 }, { autoAlpha: 1, x: 0, y: 0, duration: 0.45, ease: "power2.out" }, s.t + 0.15);
+    tl.set("#k-tile", { textContent: "K_" + (j + 1) }, s.t);
+    tl.set("#v-tile", { textContent: "V_" + (j + 1) }, s.t);
+    // 局部 S 计算闪现
+    tl.fromTo("#sij", { autoAlpha: 0 }, { autoAlpha: 1, duration: 0.3 }, s.t + 0.6);
+    tl.to("#sij", { autoAlpha: 0.25, duration: 0.3 }, s.t + 1.15);
+    // 累积量更新
+    tl.set("#fa-m", { textContent: s.m }, s.t + 0.75);
+    tl.set("#fa-l", { textContent: s.l }, s.t + 0.9);
+    tl.set("#fa-o", { textContent: s.o }, s.t + 1.05);
+    if (j < 3) {
+      tl.to(".kv-tile", { autoAlpha: 0, duration: 0.25 }, s.t + 1.6);
+    }
+  });
+  tl.to("#fa-io", { opacity: 1, duration: 0.4 }, 11.6);
+  cap(12.2, "数值上与标准 attention 等价 —— 纯工程优化：Prefill 提速 2–4×，显存 O(N²)→O(N)");
+  tl.to("#scene", { autoAlpha: 0, duration: 0.5 }, 13.4);
+
+  window.__timelines = window.__timelines || {};
+  window.__timelines["flash-attention"] = tl;
+  if (new URLSearchParams(location.search).has("autoplay")) { tl.repeat(-1).play(); }
+})();
+</script>
+</body>
+</html>
